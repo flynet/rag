@@ -21,9 +21,9 @@ This is the state of the code in this repository, not a target design.
 | Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
 | Document encoding | Plain text, no instruction |
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=8`, `RAG_MIN_SCORE=0.3` (measured with `--sweep`) |
-| Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
+| Multi-turn queries | `RAG_QUERY_REWRITE=off|concat|llm`, default `concat`: with only the last user message embedded, 2 of 9 follow-up conversations have no expected hit in the top ten (`recall@10` `0.778`, `MRR@10` `0.277`); prepending the last 3 user turns closes both (`recall@10` `1.000`, `MRR@10` `0.420`) with no extra upstream call, so `concat` is the default; `llm` ranks higher (`MRR@10` `0.514`) and costs one extra upstream call per follow-up, so it stays opt-in |
 | Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
-| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; one keep-alive connection per run; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557` |
+| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation (in gateway mode `--corpus` rebuilds each chunk's text from `char_start:char_end`, so one dataset works in both modes); one keep-alive connection per run; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557`, measured identically through the gateway |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
@@ -55,7 +55,7 @@ implemented yet.
 - Bearer authentication with static keys
 - The upstream key stays in the gateway; the agent's `Authorization` header is never forwarded
 - Per-request RAG control via `X-RAG-*` headers
-- Optional follow-up query rewriting (`RAG_QUERY_REWRITE=concat|llm`), off by default
+- Follow-up query rewriting (`RAG_QUERY_REWRITE=off|concat|llm`), `concat` by default
 - A single embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
 - Incremental indexing: unchanged files are skipped based on a stored signature
 - Retrieval evaluation harness (`recall@k`, `MRR`, `nDCG`) with a JSONL question set
@@ -138,13 +138,19 @@ implemented yet.
 │   ├── corpus/                  # snapshot of the documents the baseline is measured on
 │   ├── baseline.json            # committed baseline numbers + sweep grid
 │   ├── baseline-prompt-off.json # the same set with the query prompt disabled
-│   ├── multiturn-gateway.json   # follow-up retrieval through the gateway
+│   ├── gateway-singleturn-off.json      # 60 single-turn questions, rewrite off
+│   ├── gateway-singleturn-concat.json   # the same set, rewrite concat (no regression)
+│   ├── multiturn-off.json       # 9 follow-up conversations, rewrite off
+│   ├── multiturn-gateway.json   # the same set, rewrite concat (the default)
+│   ├── multiturn-llm.json       # the same set, rewrite llm
 │   ├── sweep.md                 # top_k × min_score tables for the chosen defaults
 │   ├── sweep-prompt-off.md      # the same grid without the query instruction
-│   ├── sweep-multiturn.md       # the same grid on follow-up conversations
+│   ├── sweep-multiturn.md       # the same grid on follow-up conversations (concat)
+│   ├── sweep-multiturn-llm.md   # the same grid with the llm rewrite
 │   └── perf-probe.json          # measured search latency under ingest
 ├── tests/
-│   └── test_eval_metrics.py     # unit tests for the eval math (no GPU/API needed)
+│   ├── test_eval_metrics.py     # unit tests for the eval math (no GPU/API needed)
+│   └── test_gateway_rewrite.py  # follow-up rewrite: single-turn guarantee, concat, llm fallback
 ├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
@@ -465,11 +471,43 @@ If the `api` service is unavailable, the gateway does **not** break chat: the re
 
 `RAG_QUERY_REWRITE` controls whether retrieval sees the conversation history:
 
-- `off` (default) — only the last user message is embedded.
-- `concat` — for short or elliptical messages ("and the second one?"), the last `RAG_REWRITE_HISTORY` user messages are joined with the current one.
+- `off` — only the last user message is embedded.
+- `concat` (default) — for short or elliptical messages ("and the second one?"), the last `RAG_REWRITE_HISTORY` user messages are joined with the current one.
 - `llm` — the gateway asks the upstream model to rewrite the message into a standalone query; this adds one upstream call, is bounded by `RAG_REWRITE_TIMEOUT`, and falls back to `concat` on failure.
 
-Tool loops are unchanged: retrieval still runs only for a fresh user turn. The rewrite is a heuristic; enable it after the evaluation set covers multi-turn follow-ups.
+Measured on `eval/questions.multiturn.jsonl` (9 follow-up conversations through the
+gateway, 20 candidates, threshold disabled; committed as
+`eval/multiturn-off.json`, `eval/multiturn-gateway.json` (`concat`),
+`eval/multiturn-llm.json`, each recording the mode it ran with):
+
+| mode | recall@5 | recall@10 | MRR@10 | nDCG@10 | latency (avg / p95) |
+|---|---|---|---|---|---|
+| `off` | 0.667 | 0.778 | 0.277 | 0.392 | 4.45 s / 4.94 s |
+| `concat` | 0.778 | 1.000 | 0.420 | 0.770 | 6.08 s / 7.01 s |
+| `llm` | 0.889 | 1.000 | 0.514 | 0.781 | 4.09 s / 4.91 s |
+
+Elliptical follow-ups are the case the rewrite is for: without history two of the
+nine questions have no expected hit in the top ten at all. `concat` costs no extra
+upstream call, so it is the default; `llm` adds one call per rewritten follow-up,
+bounded by `RAG_REWRITE_TIMEOUT`, and buys a better ranking of the injected context
+(at the shipped `min_score=0.3` it keeps the relevant chunk in the injected
+`top_k=8` for all nine follow-ups, `concat` for eight, `off` for six —
+`eval/sweep-multiturn-llm.md`, `eval/sweep-multiturn.md`). The extra call is not
+separable from upstream load in these runs: latencies measured `4.09–6.08 s` average
+and `4.91–7.01 s` p95, with `llm` the fastest of the three, so the cost of `llm` is
+documented as one extra upstream call per follow-up, not as a measured number of
+milliseconds. The set is small
+and its ground truth is section-level, so the ordering is directional, not a law.
+Requests without history, and long non-elliptical questions, are never rewritten.
+Measured on the 60-question set through the gateway
+(`eval/gateway-singleturn-off.json`, `eval/gateway-singleturn-concat.json`): both
+modes give `recall@5` `0.683`, `recall@10` `0.800`, `MRR@10` `0.414`, `nDCG@10`
+`0.557`, with the same twelve top-10 failures as `eval/baseline.json` — enabling a
+rewrite mode does not move a single-turn answer (latency `4.33 s` avg / `5.01 s` p95
+`off`, `4.34 s` / `4.97 s` `concat`, no rewrite fired on that set). Tool loops are
+unchanged: retrieval still runs only for a fresh user turn. The rewrite is a
+heuristic: it resolves references ("it", "the second one"), not topics the user
+never stated.
 
 **Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, and `chars="start-end"` attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
@@ -507,7 +545,7 @@ Public, no authentication. Checks the model server and the `api` service.
   "status": "ok",
   "rag_enabled": true,
   "auth_required": true,
-  "defaults": {"top_k": 8, "min_score": 0.3},
+  "defaults": {"top_k": 8, "min_score": 0.3, "query_rewrite": "concat", "rewrite_history": 3},
   "dependencies": {
     "upstream": {"url": "http://192.168.1.50:8000/v1", "ok": true, "status": 200},
     "api": {"url": "http://api:8000", "ok": true, "status": 200}
@@ -536,7 +574,7 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `ENABLE_RAG` | `true` | global RAG switch |
 | `RAG_TOP_K` | `8` | chunks injected into the prompt; measured value (sweep), not a default |
 | `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; measured value (sweep), model-dependent |
-| `RAG_QUERY_REWRITE` | `off` | follow-up query mode: `off`, `concat`, or `llm` |
+| `RAG_QUERY_REWRITE` | `concat` | follow-up query mode: `off`, `concat`, or `llm`; measured on the follow-up set |
 | `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
 | `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
 | `UPSTREAM_BASE_URL` | — | OpenAI-compatible server URL (`.../v1` or without) |
@@ -717,7 +755,7 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 - **No reranker** — the top-`k` dense results go straight into the prompt.
 - **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
 - **Single GPU service** — bulk indexing and user queries share the same model; encode calls are serialized by `EMBEDDING_MAX_CONCURRENCY` (default `1`), so indexing load shows up as search latency. No dynamic batching.
-- **Multi-turn follow-ups** — supported via `RAG_QUERY_REWRITE=concat|llm`, disabled by default; the harness measures follow-ups in `gateway` mode (`history` in the dataset), so the default stays off until the sweep on follow-ups is done.
+- **Multi-turn follow-ups** — `RAG_QUERY_REWRITE` defaults to `concat`; the rewrite is a keyword heuristic that resolves references in short messages, not a topic model. Measured on 9 follow-ups, `concat` recovers the two elliptical questions that the raw last message misses, `llm` ranks higher at one extra upstream call per follow-up, and `off` leaves 2 of 9 follow-ups with no expected hit in the top ten. The follow-up set is small (9 conversations, section-level ground truth), so the ordering is directional.
 - **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
 - **Model-dependent threshold** — `RAG_MIN_SCORE` must be re-tuned after changing the embedding model.
 
@@ -810,7 +848,7 @@ The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
 | P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set | done, measured values committed |
 | P1 | Reranker (retrieve 30–50, pass 5–8) | pending |
 | P1 | Structure-aware chunking and citation metadata | done, re-indexed |
-| P1 | Multi-turn query rewriting | implemented, off by default |
+| P1 | Multi-turn query rewriting | done, `concat` by default: `recall@10` 0.778 → 1.000 on the follow-up set |
 | P2 | Hybrid BM25 + dense search with RRF | pending |
 | P2 | Healthchecks, pinned Qdrant version, snapshots | done |
 | P3 | TEI/vLLM backend, query cache, quantization, larger model, pgvector | pending |

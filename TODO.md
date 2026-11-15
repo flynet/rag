@@ -144,11 +144,13 @@ recall@8 to 0.483 and leaves 23% of questions with no context, `0.6` leaves 52%.
 `0.3` costs nothing over the disabled threshold, so it is the safe operating point.
 Query prompt on/off: on = recall@8 0.783 / MRR@10 0.414, off = recall@8 0.683 /
 MRR@10 0.455; the prompt is kept on because coverage at `top_k=8` is what the
-injection budget needs. Follow-up set (9 conversations, gateway, rewrite off):
-`min_score=0.5` leaves 33% of follow-ups with no context and recall@8 0.333,
-`0.3` keeps recall@8 0.667 with 0% zero-context — the same threshold is safe for
-conversations, `0.5` is not. Re-run `--sweep` after any model, chunking, or
-query-prompt change; the numbers are not transferable.
+injection budget needs. Follow-up set (9 conversations, gateway, rewrite `concat`,
+the committed sweep `eval/sweep-multiturn.md`): `min_score=0.5` leaves 11% of the
+follow-ups with no context at all and recall@8 0.667, `0.6` leaves 67% and recall@8
+0.333, `0.3` keeps recall@8 0.889 with 0% zero-context. With rewrite `off` the same
+thresholds are far worse (78% and 100% zero-context), so a threshold tuned on
+single-turn questions alone is not safe for conversations. Re-run `--sweep` after any
+model, chunking, or query-prompt change; the numbers are not transferable.
 
 ---
 
@@ -192,7 +194,7 @@ query-prompt change; the numbers are not transferable.
 
 **Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. The live pipeline is verified through Docker: `embedder` indexed `example.txt` (`Upserted 1 chunks for /data/documents/example.txt`), `api` `/collection/info` reports `points=1 dim=1024`, `/collection/sample` and `X-RAG-Sources` carry `title`, `section`, `char_start`, `char_end`, and the chat answer cited `/data/documents/example.txt` from the injected passage. The corpus was re-indexed with `CHUNKER_VERSION = 2` (192 chunks over 5 files) and the evaluation now runs against it: P0.1 numbers are the baseline floor, recorded before any later change. There are no pre-chunker numbers to compare against, so the acceptance criterion "improves or stays flat" is measured from this point forward. Indexing 5 documents (about 86 KB of text) took under a minute. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words).
 
-### [~] P1.3 Multi-turn query rewriting
+### [x] P1.3 Multi-turn query rewriting
 
 **Why:** the gateway embeds only the last user message. A follow-up like "and the second one?" produces a meaningless query.
 
@@ -209,7 +211,15 @@ query-prompt change; the numbers are not transferable.
 - Single-turn questions do not regress.
 - Added latency is bounded and documented.
 
-**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The harness can now measure gateway-level rewriting: `--mode gateway` sends the `history` turns plus the follow-up to `/v1/chat/completions` with `X-RAG-TOP-K=20` and the threshold disabled, and reads the sources back from `X-RAG-Sources` (header names are normalized to lowercase, because uvicorn lowercases them). `eval/questions.multiturn.jsonl` is the follow-up set: 9 conversations, ground truth by `file` + `section`. Measured with `RAG_QUERY_REWRITE=off` (the current default): recall@5=0.667, recall@10=0.778, MRR@10=0.277, nDCG@10=0.392; the sweep on the same pass shows `RAG_MIN_SCORE=0.5` leaving 78% of follow-ups with no context at all, `0.3` leaving 11%. Remaining work: compare `off` / `concat` / `llm` on this set with the tuned threshold, and record the added upstream latency.
+**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`): requests without history and long non-elliptical questions are never rewritten, `llm` is time-boxed by `RAG_REWRITE_TIMEOUT` (10 s), falls back to `concat` on failure, and rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The default is `concat` in the gateway code, `docker-compose.yaml` and `.env.example`, measured on `eval/questions.multiturn.jsonl` (9 follow-up conversations, gateway mode, 20 candidates requested, threshold disabled, frozen corpus, one session):
+
+| mode | recall@5 | recall@10 | MRR@10 | nDCG@10 | latency avg / p95 |
+|---|---|---|---|---|---|
+| `off` | 0.667 | 0.778 | 0.277 | 0.392 | 4.45 s / 4.94 s |
+| `concat` (default) | 0.778 | 1.000 | 0.420 | 0.770 | 4.66 s / 4.95 s |
+| `llm` | 0.889 | 1.000 | 0.514 | 0.781 | 4.09 s / 4.91 s |
+
+Single-turn non-regression is measured, not assumed: 60 single-turn questions through the gateway give `recall@10 0.800` / `MRR@10 0.414` in both `off` and `concat` (`eval/gateway-singleturn-off.json`, `eval/gateway-singleturn-concat.json`), and the guarantee is also covered offline by `tests/test_gateway_rewrite.py` (16 tests: first turn untouched, `concat` joins recent user turns only, `llm` fallback and cache, no upstream call for non-follow-ups). Latency: upstream generation dominates (~4 s per question on the measured server) and the extra `llm` call was not separable from that noise in these runs (the three runs measured 4.09–6.08 s average, 4.91–7.01 s p95, `llm` the fastest), so the cost of `llm` is documented as one extra upstream call per rewritten follow-up, bounded by `RAG_REWRITE_TIMEOUT`, not as a measured millisecond figure. Threshold tuning matters more for follow-ups than for single-turn questions: with rewrite `off`, `RAG_MIN_SCORE=0.5` strips all context from 78% of the follow-ups and `0.6` from 100%; with `concat`, `0.5` strips 11% and `0.6` 67%; with `llm`, 22% and 67%. At `min_score=0.3` zero-context is 0% in every mode, and recall@8 at that threshold is 1.000 (`llm`), 0.889 (`concat`), 0.667 (`off`) — `RAG_MIN_SCORE=0.3` is kept, and `llm` is the mode that gains most from a wide `top_k`. The gateway reports its effective mode in `/health` (`defaults.query_rewrite` + `rewrite_history`), the harness records it in every gateway run as `gateway_defaults` and prints it before the run, so each committed result file says which mode produced it; `eval/README.md` documents that the mode is read at container creation, so a change needs `docker compose up -d --force-recreate gateway`, and that two eval sessions must not share one gateway container (a run measured against a container recreated by another session reports the mode it did not run with).
 
 ---
 

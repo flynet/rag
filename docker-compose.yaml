@@ -134,7 +134,7 @@ services:
       - RAG_TOP_K=${RAG_TOP_K:-8}
       - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.3}
       # off | concat | llm - rewrite follow-up questions before retrieval
-      - RAG_QUERY_REWRITE=${RAG_QUERY_REWRITE:-off}
+      - RAG_QUERY_REWRITE=${RAG_QUERY_REWRITE:-concat}
       - RAG_REWRITE_HISTORY=${RAG_REWRITE_HISTORY:-3}
       - RAG_REWRITE_TIMEOUT=${RAG_REWRITE_TIMEOUT:-10}
       - UPSTREAM_TIMEOUT=${UPSTREAM_TIMEOUT:-600}

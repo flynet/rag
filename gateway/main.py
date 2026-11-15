@@ -112,13 +112,23 @@ RAG_TIMEOUT = _env_float("RAG_TIMEOUT", 30.0)
 # Follow-up query handling: off | concat | llm. "concat" joins previous user
 # turns for short/elliptical messages; "llm" asks the upstream model to rewrite
 # the query, falling back to concatenation when the call fails.
-RAG_QUERY_REWRITE = os.environ.get("RAG_QUERY_REWRITE", "off").strip().lower() or "off"
+# Default "concat": on eval/questions.multiturn.jsonl (9 follow-ups, gateway
+# mode, one session with the mode read back from /health before each run) the raw
+# last user message misses the top ten on 2 of 9 questions - recall@5 0.667,
+# recall@10 0.778, MRR@10 0.277, nDCG@10 0.392. Prepending the last 3 user turns
+# closes both: 0.778/1.000/0.420/0.770, with no extra upstream call. "llm" scores
+# 0.889/1.000/0.514/0.781 and pays for it with one extra upstream call per
+# follow-up, bounded by RAG_REWRITE_TIMEOUT, so it stays opt-in for phrasings
+# concatenation cannot resolve. Requests without history, and long non-elliptical
+# questions, are never rewritten: on the 60 single-turn questions through the
+# gateway, off and concat give identical recall@10 0.800 and MRR@10 0.414.
+RAG_QUERY_REWRITE = os.environ.get("RAG_QUERY_REWRITE", "concat").strip().lower() or "concat"
 if RAG_QUERY_REWRITE not in {"off", "concat", "llm"}:
     log.warning(
-        "Unknown RAG_QUERY_REWRITE=%r - using 'off' (expected off|concat|llm)",
+        "Unknown RAG_QUERY_REWRITE=%r - using 'concat' (expected off|concat|llm)",
         RAG_QUERY_REWRITE,
     )
-    RAG_QUERY_REWRITE = "off"
+    RAG_QUERY_REWRITE = "concat"
 RAG_REWRITE_HISTORY = max(1, _env_int("RAG_REWRITE_HISTORY", 3))
 RAG_REWRITE_TIMEOUT = _env_float("RAG_REWRITE_TIMEOUT", 10.0)
 RAG_REWRITE_MAX_TOKENS = max(16, _env_int("RAG_REWRITE_MAX_TOKENS", 128))
@@ -910,7 +920,12 @@ async def health():
         "status": "ok" if upstream["ok"] and api["ok"] else "degraded",
         "rag_enabled": ENABLE_RAG,
         "auth_required": bool(API_KEYS),
-        "defaults": {"top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE},
+        "defaults": {
+            "top_k": RAG_TOP_K,
+            "min_score": RAG_MIN_SCORE,
+            "query_rewrite": RAG_QUERY_REWRITE,
+            "rewrite_history": RAG_REWRITE_HISTORY,
+        },
         "dependencies": {
             "upstream": {"url": UPSTREAM_BASE_URL or None, **upstream},
             "api": {"url": API_URL, **api},

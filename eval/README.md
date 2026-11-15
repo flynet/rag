@@ -43,10 +43,13 @@ the chunker changes, while a distinctive phrase does not. Use `file` alone when
 any chunk of the document is acceptable, and `section` when the answer is tied to
 a heading rather than to exact wording.
 
-**Gateway mode cannot use `text_contains`**: `X-RAG-Sources` carries file, chunk,
-score, title, section and character offsets, not the chunk text. Ground truth in
-gateway mode must use `file`, `chunk` and `section` (the loader rejects
-`text_contains` in that mode).
+**`text_contains` in gateway mode needs `--corpus`**: `X-RAG-Sources` carries file,
+chunk, score, title, section and character offsets, not the chunk text. With
+`--corpus` the harness reads the file from the corpus snapshot, normalizes it the
+way the chunker does (CRLF/CR to LF), and slices `char_start:char_end` to recover
+the chunk text, so `text_contains` works in gateway mode as well. Without
+`--corpus` the loader rejects `text_contains` in gateway mode; use `file` and
+`chunk` there.
 
 `eval/questions.example.jsonl` contains schema examples for the sample document.
 `eval/questions.jsonl` is the real question set used for the baseline.
@@ -167,12 +170,22 @@ The sweeps that produced the committed values are kept in the repository:
 |---|---|---|
 | `eval/sweep.md` + `eval/baseline.json` | `EMBEDDING_QUERY_PROMPT=query`, 60 questions | `top_k=8` + `min_score=0.3`: recall@8 `0.783`, zero-context `0%` |
 | `eval/sweep-prompt-off.md` + `eval/baseline-prompt-off.json` | `EMBEDDING_QUERY_PROMPT=` (no instruction), 60 questions | best recall@8 `0.683`, MRR@10 `0.455` — lower coverage, higher top-3 precision |
-| `eval/sweep-multiturn.md` + `eval/multiturn-gateway.json` | 9 follow-up conversations, gateway mode, rewrite off | `min_score=0.3`: recall@8 `0.667`, zero-context `0%`; `0.5`: recall@8 `0.333`, zero-context `33%` |
+| `eval/gateway-singleturn-off.json` + `eval/gateway-singleturn-concat.json` | 60 single-turn questions, gateway mode, rewrite `off` vs `concat` | both `recall@10 0.800`, `MRR@10 0.414` — the rewrite does not touch single-turn requests |
+| `eval/multiturn-off.json` | 9 follow-up conversations, gateway, rewrite `off` | recall@5 `0.667`, recall@10 `0.778`, MRR@10 `0.277`, nDCG@10 `0.392` — 2 of 9 follow-ups have no expected hit in the top ten |
+| `eval/multiturn-gateway.json` + `eval/sweep-multiturn.md` | the same 9 conversations, rewrite `concat` (the shipped default) | recall@5 `0.778`, recall@10 `1.000`, MRR@10 `0.420`, nDCG@10 `0.770`; `min_score=0.3`: recall@8 `0.889`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `11%`; `0.6`: `67%` |
+| `eval/multiturn-llm.json` + `eval/sweep-multiturn-llm.md` | the same 9 conversations, rewrite `llm` | recall@5 `0.889`, recall@10 `1.000`, MRR@10 `0.514`, nDCG@10 `0.781`; `min_score=0.3`: recall@8 `1.000`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `22%` — the best ranking, at one extra upstream call per follow-up |
 
-`RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` is the choice all three tables support. The
-follow-up table is the binding one: an elliptical question ("and the min score?")
-embeds weakly, so a threshold tuned on single-turn questions alone silently
-strips the context of real conversations.
+`RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` is the choice all the tables support, and the
+follow-up sweep (`eval/sweep-multiturn.md`) is the binding one for the threshold:
+an elliptical question ("and the min score?") embeds weakly, so a threshold tuned
+on single-turn questions alone silently strips the context of real conversations.
+With the rewrite `off`, `min_score=0.5` leaves `78%` of the follow-ups with no
+context at all and `0.6` leaves `100%`; with `concat` the same thresholds leave
+`11%` and `67%`, and at `0.3` zero-context is `0%` in every mode. So `min_score`
+stays at `0.3`. `RAG_QUERY_REWRITE=concat` is the default for the mirror-image
+reason: `off` misses the top ten on 2 of 9 follow-ups, `concat` closes both at no
+extra upstream cost, and `llm` ranks higher still (`recall@8` `1.000` at
+`min_score=0.3`) for one extra upstream call, so it stays opt-in.
 
 Reproduce the record from a fresh clone:
 
@@ -186,10 +199,45 @@ python scripts/eval_retrieval.py --questions eval/questions.jsonl --sweep \
 docker compose up -d api
 python scripts/eval_retrieval.py --questions eval/questions.jsonl --sweep \
     --sweep-md eval/sweep-prompt-off.md --json-out eval/baseline-prompt-off.json
-python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl \
-    --mode gateway --sweep --sweep-md eval/sweep-multiturn.md \
-    --json-out eval/multiturn-gateway.json
 ```
+
+The rewrite comparison recreates the gateway per mode. `POST /health` reports the
+mode the container picked up (`"query_rewrite"` in `defaults`); check it before
+measuring, because a container that was only restarted keeps the environment it was
+created with:
+
+```powershell
+$env:RAG_QUERY_REWRITE = "off"
+docker compose up -d --force-recreate gateway
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
+    --corpus eval/corpus --json-out eval/gateway-singleturn-off.json
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --json-out eval/multiturn-off.json
+$env:RAG_QUERY_REWRITE = "concat"
+docker compose up -d --force-recreate gateway
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
+    --corpus eval/corpus --json-out eval/gateway-singleturn-concat.json
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --sweep --sweep-md eval/sweep-multiturn.md \
+    --json-out eval/multiturn-gateway.json
+$env:RAG_QUERY_REWRITE = "llm"
+docker compose up -d --force-recreate gateway
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --sweep --sweep-md eval/sweep-multiturn-llm.md \
+    --json-out eval/multiturn-llm.json
+Remove-Item Env:RAG_QUERY_REWRITE
+docker compose up -d --force-recreate gateway   # back to the shipped default (concat)
+```
+
+Each gateway run prints the mode it measured against
+(`gateway rewrite: concat (history=3)`, read from `/health`), so a run that got a
+container created with a different mode is visible in its own output, and every
+committed result file stores the mode in `gateway_defaults`. Warm up the connection
+before a measured run (`--limit 1`): the first request after a container is created
+pays the Windows connection setup (~20 s), which would otherwise land in the
+latency numbers. Run the modes one after another in one session — a container
+recreated by a parallel session, on a shared machine, is enough to make a measured
+run report the wrong mode.
 
 ## Metrics
 
@@ -208,8 +256,13 @@ The dataset is 60 questions (`eval/questions.jsonl`) over the committed corpus
 (202 chunks: `README.md` 68, `TODO.md` 80, `env_example.txt` 40,
 `eval_README.md` 13, `example.txt` 1). Ground truth is `file` + `text_contains`,
 validated offline against `eval/corpus` and checked against the indexed chunks,
-so every needle exists in the collection. Measured with `top_k=50`,
-`min_score: null`:
+so every needle exists in the collection. The corpus is a **frozen snapshot** of
+the project docs: editing `README.md` in the repository does not move the baseline,
+and the reproduce step copies the snapshot into `data/documents`, so a needle that
+stops existing in the snapshot has to be re-pointed in `eval/questions.jsonl`
+(`q-056` cites the rewrite bullets in `env_example.txt`, where the snapshot marks
+`off` as the default — the shipped default is now `concat`, and the snapshot is
+frozen, so the needle stays as it is). Measured with `top_k=50`, `min_score: null`:
 
 | Metric | Value | Recorded gate |
 |---|---|---|
@@ -241,10 +294,17 @@ added.
 
 ## Notes
 
-- `eval/baseline.json` (search mode: metrics, per-question ranks, sweep grid) and
-  `eval/multiturn-gateway.json` (gateway mode: follow-up retrieval) are generated
-  by `--json-out`, not hand-written. Commit them after a deliberate quality change
-  so regressions are visible later.
+- `eval/baseline.json` (search mode: metrics, per-question ranks, sweep grid),
+  `eval/gateway-singleturn-off.json` / `eval/gateway-singleturn-concat.json` (60
+  single-turn questions through the gateway) and
+  `eval/multiturn-off.json` / `eval/multiturn-gateway.json` /
+  `eval/multiturn-llm.json` (9 follow-up conversations, one rewrite mode each) are
+  generated by `--json-out`, not hand-written, together with
+  `eval/sweep-multiturn.md` (the `concat` grid) and `eval/sweep-multiturn-llm.md`
+  (the `llm` grid). A gateway run records the gateway's
+  own defaults in `gateway_defaults` (read from `/health`), so every committed
+  file says which rewrite mode produced its numbers. Commit them after a deliberate
+  quality change so regressions are visible later.
 - The harness reuses **one keep-alive connection** for the whole run. On Windows a
   fresh TCP connection to a Docker-published port costs ~20 s, so opening one per
   question turns a 60-question run into ~20 minutes of connection setup; reusing
@@ -255,12 +315,23 @@ added.
   repository.
 - Gateway mode calls the upstream LLM once per question (answers are not
   evaluated, only the retrieved sources), so it is slower and needs a working
-  `UPSTREAM_BASE_URL`.
+  `UPSTREAM_BASE_URL`. `RAG_QUERY_REWRITE=llm` adds one more call per follow-up,
+  bounded by `RAG_REWRITE_TIMEOUT`.
+- Absolute latency depends on the upstream server, so compare modes in one session
+  on a warmed connection: the first request after a container is created pays the
+  connection setup (~20 s on Windows), and a loaded upstream inflates every run.
+  Warm up with `--limit 1` before the measured run.
+- The gateway picks up `RAG_QUERY_REWRITE` when the container is **created**, so
+  an env change needs `docker compose up -d --force-recreate gateway`; check the
+  mode in `/health` before measuring, and never run two eval sessions against the
+  same container at the same time.
 
 ## Tests
 
 The metric, sweep, matching, dataset and corpus-check logic is covered by unit
-tests that need no GPU, API, or Docker:
+tests that need no GPU, API, or Docker, and the follow-up rewrite (the single-turn
+guarantee, `concat` history joining, `llm` fallback and cache) by gateway tests
+that import `gateway/main.py` without running it:
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
