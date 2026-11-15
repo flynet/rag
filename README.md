@@ -31,39 +31,42 @@ There is no chat UI — the service exposes an API only. Any OpenAI-compatible c
 
 ```text
 ┌──────────────┐
-│ Agent / LLM  │  OpenAI SDK, LangChain, Continue, Cline, ...
+│ Agent / LLM  │  OpenAI SDK, LangChain, Continue, Cline
 │   client     │
 └──────┬───────┘
-       │  POST /v1/chat/completions
+       │ POST /v1/chat/completions
        v
-┌─────────────────────────┐
-│ Gateway      :8001      │  single public entry point
-│ • agent bearer auth     │
-│ • retrieval via api     │
-│ • context injection     │
-│ • upstream auth swap    │
-└────┬───────────────┬────┘
-     │               │
-     v               v
-┌──────────────────┐   ┌───────────────────┐
-│ LLM server (LAN) │   │ API       :8000   │
-│ vLLM / LM Studio │   │ 1× embedding      │
-│ llama.cpp / cloud│   │ model (fp16)      │
-└──────────────────┘   └────┬─────────┬────┘
-                            │         ▲
-                            v         │ POST /embed
-                      ┌──────────┐    │
-                      │  Qdrant  │    │
-                      │  :6333   │    │
-                      └────▲─────┘    │
-                           │          │
-                      ┌────┴──────────┴┐
-                      │  Embedder      │
-                      │  (watchdog)    │
-                      └────────┬───────┘
-                               v
-                       data/documents/
+┌──────────────────────────────┐
+│ Gateway            :8001     │  the gateway is the only entry point for agents
+│ • bearer auth                │
+│ • retrieval via api          │
+│ • context injection          │
+│ • upstream auth swap         │
+└─────┬────────────┬───────────┘
+      │ chat       │ POST /search, /v1/embeddings
+      v            v
+┌─────────────┐ ┌────────────────────────┐
+│ LLM server  │ │ API            :8000   │
+│ (LAN/cloud) │ │ embedding model        │
+│ vLLM / LM   │ │ fp16 on GPU (only here)│
+│ llama.cpp   │
+└─────────────┘ └──┬───────────▲─────────┘
+                   │ search    │ POST /embed
+                   v           │ (vectors)
+              ┌──────────────┐
+              │ Qdrant       │
+              │ :6333        │
+              └────▲─────────┘
+                   │ upsert    │
+              ┌────┴───────────┴─────────┐
+              │ Embedder                 │
+              │ watchdog, no torch       │
+              └────────▲─────────────────┘
+                       │ watches files, reads text
+              data/documents/
 ```
+
+The arrows are the calls the services actually make: `gateway → upstream` (chat), `gateway → api` (`POST /search`, `POST /v1/embeddings`), `api → qdrant` (search), `embedder → api` (`POST /embed` — vectors), `embedder → qdrant` (upsert), `embedder → data/documents` (watch and read).
 
 ## Project structure
 
