@@ -1,7 +1,8 @@
 # vector_db.py
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from qdrant_client import QdrantClient
@@ -115,6 +116,59 @@ class VectorDB:
             collection_name=self.collection_name,
             points_selector=FilterSelector(filter=flt),
         )
+
+    # ------------------------------------------------------------------ #
+    # Startup reconciliation
+    # ------------------------------------------------------------------ #
+
+    def reconcile_files(self, root: Path, batch_size: int = 256) -> Tuple[int, int]:
+        """Remove vectors of files that are no longer present under `root`.
+
+        The watcher only sees changes while this process is running. Files
+        deleted or renamed while the stack was down would otherwise stay in
+        Qdrant and keep appearing in search results. Returns
+        ``(number of files, number of chunks)`` removed.
+        """
+        root = root.resolve()
+        counts: Dict[str, int] = {}
+
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=batch_size,
+                offset=offset,
+                with_payload=["file"],
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                file_path = payload.get("file")
+                if isinstance(file_path, str) and file_path:
+                    counts[file_path] = counts.get(file_path, 0) + 1
+            if offset is None:
+                break
+
+        missing = {
+            file_path: count
+            for file_path, count in counts.items()
+            if not self._is_indexed_file(file_path, root)
+        }
+        for file_path in missing:
+            self.delete_by_file(file_path)
+
+        return len(missing), sum(missing.values())
+
+    @staticmethod
+    def _is_indexed_file(file_path: str, root: Path) -> bool:
+        """True when `file_path` is an existing file under the watched root."""
+        try:
+            path = Path(file_path)
+            if not path.is_file():
+                return False
+            return path.resolve().is_relative_to(root)
+        except (OSError, RuntimeError):
+            return False
 
     # ------------------------------------------------------------------ #
     # Change detection

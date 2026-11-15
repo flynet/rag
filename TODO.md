@@ -28,42 +28,43 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 ## P0 — Correctness and measurement
 
-### [ ] P0.1 Retrieval evaluation harness
+### [~] P0.1 Retrieval evaluation harness
 
 **Why:** there is currently no way to tell whether a change (model, chunking, reranker, prompt) improves retrieval.
 
 **Scope:**
 - [ ] Create `eval/questions.jsonl` with 50–200 real questions.
 - [ ] Ground truth per question: `file` plus either `chunk` index or a text substring unique to the relevant chunk.
-- [ ] Add `scripts/eval_retrieval.py` (stdlib or `httpx`) that calls `POST /search` with `min_score: null` and `top_k` 10 and 50.
-- [ ] Metrics: `recall@5`, `recall@10`, `MRR@10`, optionally `nDCG@10`.
-- [ ] Print per-question failures (missed / wrong rank) and a summary table.
+- [x] Add `scripts/eval_retrieval.py` (stdlib) that calls `POST /search` with `min_score: null` and `top_k` 10 and 50.
+- [x] Metrics: `recall@5`, `recall@10`, `MRR@10`, `nDCG@10`.
+- [x] Print per-question failures (missed / wrong rank) and a summary table.
 - [ ] Save the baseline for `Qwen3-Embedding-0.6B` to `eval/baseline.json`.
+- [x] Document the dataset format and usage in `eval/README.md`.
 
 **Acceptance criteria:**
 - One command runs the whole set and exits non-zero on a configurable metric regression.
 - Baseline numbers for the current model are committed.
 - Questions cover: exact terms/identifiers, paraphrases, Russian/English, and multi-chunk answers.
 
-**Notes:** keep the dataset small but representative; 50 well-chosen questions are better than 500 synthetic ones. Do not tune on the same questions you report as final — keep a held-out subset.
+**Notes:** the harness, schema, example dataset, and `--min-recall`/`--min-mrr` gates are in place. Remaining work: add real questions and commit the baseline. Keep the dataset small but representative; 50 well-chosen questions are better than 500 synthetic ones. Do not tune on the same questions you report as final — keep a held-out subset.
 
-### [ ] P0.2 Startup reconciliation of stale vectors
+### [~] P0.2 Startup reconciliation of stale vectors
 
 **Why:** files deleted or renamed while the stack was stopped leave their chunks in Qdrant and remain searchable. The startup scan only queues files that exist.
 
 **Scope:**
-- [ ] On startup, read distinct `payload.file` values from Qdrant (scroll with `with_payload=["file"]`, `with_vectors=False`, batched).
-- [ ] Compare with the files present under `WATCH_PATH`.
-- [ ] Delete vectors for missing files (`delete_by_file`).
-- [ ] Handle renamed files as delete + index (no duplicate paths).
-- [ ] Log a summary: `removed N orphaned files / M chunks`.
+- [x] On startup, read distinct `payload.file` values from Qdrant (scroll with `with_payload=["file"]`, `with_vectors=False`, batched).
+- [x] Compare with the files present under `WATCH_PATH`.
+- [x] Delete vectors for missing files (`delete_by_file`).
+- [x] Handle renamed files as delete + index (no duplicate paths).
+- [x] Log a summary: `removed N orphaned files / M chunks`.
 
 **Acceptance criteria:**
 - Stop the stack, delete a file, start the stack: its chunks are gone from `/collection/sample` and from search results.
 - Rename a file while stopped: only the new path is searchable.
 - Unchanged files are not re-embedded.
 
-**Notes:** keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
+**Notes:** implemented in `VectorDB.reconcile_files()` and called before the startup scan. Needs end-to-end verification with Docker (daemon was not running during implementation). Keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
 
 ### [ ] P0.3 Tune `RAG_TOP_K` / `RAG_MIN_SCORE`
 

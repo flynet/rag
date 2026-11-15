@@ -21,11 +21,12 @@ This is the state of the code in this repository, not a target design.
 | Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
 | Document encoding | Plain text, no instruction |
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
+| Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Fixed 1024 characters with 128-character overlap |
-| Indexing | Startup scan + `watchdog`; signature-based incremental updates |
-| Deletion handling | Live watcher events; vectors of files deleted while the stack was down are **not** removed (see [TODO.md](TODO.md)) |
+| Indexing | Startup reconciliation + scan, `watchdog`, signature-based incremental updates |
+| Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
 | Qdrant | `qdrant/qdrant:latest`, no snapshot schedule |
 | Healthchecks | Gateway only; `api` and Qdrant have none |
 | Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
@@ -44,6 +45,7 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 - Per-request RAG control via `X-RAG-*` headers
 - A single embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
 - Incremental indexing: unchanged files are skipped based on a stored signature
+- Retrieval evaluation harness (`recall@k`, `MRR`, `nDCG`) with a JSONL question set
 - Qdrant vector database
 
 ## Architecture
@@ -111,7 +113,10 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 │   └── requirements.txt
 ├── scripts/
 │   ├── smoke_test.py            # end-to-end API check
-│   └── ...
+│   └── eval_retrieval.py        # retrieval quality evaluation
+├── eval/
+│   ├── README.md                # dataset format and metrics
+│   └── questions.example.jsonl  # schema examples
 ├── qdrant_data/                 # vector DB data (created automatically)
 ├── README.md
 └── TODO.md
@@ -521,11 +526,12 @@ Copy-Item .\mydocument.txt .\data\documents\
 
 The indexer:
 
-1. scans `data/documents` at startup and queues every file;
-2. watches for changes with `PollingObserver` and a 1-second debounce;
-3. skips files whose signature matches the stored one (`mtime`, size, chunk size, overlap, model);
-4. splits changed files into 1024-character chunks with 128-character overlap;
-5. deletes the file's old vectors and upserts the new ones.
+1. reconciles the index with the filesystem at startup: vectors for files that no longer exist under `data/documents` (deleted or renamed while the stack was stopped) are removed;
+2. scans `data/documents` and queues every existing file;
+3. watches for changes with `PollingObserver` and a 1-second debounce;
+4. skips files whose signature matches the stored one (`mtime`, size, chunk size, overlap, model);
+5. splits changed files into 1024-character chunks with 128-character overlap;
+6. deletes the file's old vectors and upserts the new ones.
 
 Logs:
 
@@ -534,12 +540,13 @@ docker compose logs -f embedder
 ```
 
 ```text
+2026-11-15 13:14:33 INFO [embedder] Removed stale vectors for 1 file(s) (5 chunks)
 2026-11-15 13:14:33 INFO [embedder] Stable event for /data/documents/mydocument.txt
 2026-11-15 13:14:35 INFO [embedder] Upserted 5 chunks for /data/documents/mydocument.txt
 2026-11-15 13:14:40 INFO [embedder] Unchanged, skipping /data/documents/other.txt
 ```
 
-**Known limitation:** files deleted or renamed while the stack is stopped leave their vectors in Qdrant. The startup scan only adds existing files; it does not reconcile stale points. See [TODO.md](TODO.md) for the planned fix.
+Reconciliation walks the `file` payload field of every point, so startup cost grows with the number of chunks in the collection. For very large collections this should be replaced with a facet query or a dedicated file manifest.
 
 ## Memory and performance
 
@@ -578,11 +585,10 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 
 ## Known limitations
 
-- **No retrieval evaluation** — `RAG_TOP_K` and `RAG_MIN_SCORE` are not tuned against a labelled question set.
+- **No labelled evaluation set yet** — `scripts/eval_retrieval.py` is in place, but `RAG_TOP_K` and `RAG_MIN_SCORE` are not yet tuned against real questions.
 - **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
 - **No reranker** — the top-`k` dense results go straight into the prompt.
 - **Fixed-size chunking** — no heading/paragraph awareness and no section metadata for citations.
-- **Stale vectors after downtime** — files deleted or renamed while the stack is stopped remain searchable.
 - **No API/Qdrant healthchecks** — `depends_on` does not wait for readiness; Qdrant is pulled as `latest`.
 - **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
 - **Multi-turn follow-ups** — only the last user message is embedded, so elliptical questions ("what about the second one?") retrieve poorly.
@@ -648,8 +654,9 @@ Code map:
 - `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
 - `embedder/vector_db.py` — `VectorDB`: upsert with a file signature, `is_up_to_date`, collection recreation on dimension change
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
+- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR, nDCG) against a JSONL question set
 
-There is no unit-test suite yet; `scripts/smoke_test.py` is the current end-to-end check.
+There is no unit-test suite yet; `scripts/smoke_test.py` is the end-to-end check and `scripts/eval_retrieval.py` measures retrieval quality. See [eval/README.md](eval/README.md) for the dataset format.
 
 ## Roadmap
 

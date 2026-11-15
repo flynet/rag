@@ -1,0 +1,3 @@
+{"id": "ex-001", "question": "Who is Alice Davince?", "relevant": [{"file": "example.txt", "text_contains": "Alice Davince"}]}
+{"id": "ex-002", "question": "Where is Alice Davince from?", "relevant": [{"file": "example.txt", "text_contains": "U.S."}]}
+{"id": "ex-003", "question": "What does the example document describe?", "relevant": [{"file": "example.txt"}]}

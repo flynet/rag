@@ -197,6 +197,23 @@ async def main():
     watch_path = Path(WATCH_PATH)
     watch_path.mkdir(parents=True, exist_ok=True)
 
+    # The watcher only sees changes while this process runs, so files deleted
+    # or renamed during downtime would stay in the index. Remove them first.
+    log.info("Reconciling index with %s...", WATCH_PATH)
+    try:
+        removed_files, removed_chunks = vector_db.reconcile_files(watch_path)
+    except Exception as exc:  # noqa: BLE001 - stale data must not block startup
+        log.error("Index reconciliation failed - continuing with the scan: %s", exc)
+    else:
+        if removed_files:
+            log.info(
+                "Removed stale vectors for %d file(s) (%d chunks)",
+                removed_files,
+                removed_chunks,
+            )
+        else:
+            log.info("Index matches the filesystem (no stale files)")
+
     # Initial scan: queue everything, the worker skips unchanged files
     log.info("Scanning %s for existing files...", WATCH_PATH)
     file_count = 0
