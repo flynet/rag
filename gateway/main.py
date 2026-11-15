@@ -26,7 +26,8 @@ Per-request RAG overrides (headers):
 Retrieved sources are returned in response headers so they do not pollute the
 OpenAI response schema:
     X-RAG-Hits: 3
-    X-RAG-Sources: <base64url(unpadded) of JSON [{file, chunk, score}]>
+    X-RAG-Sources: <base64url(unpadded) of JSON
+                    [{file, chunk, score, title?, section?, char_start?, char_end?}]>
 """
 
 from __future__ import annotations
@@ -307,9 +308,24 @@ async def _rag_search(query: str, top_k: int, min_score: float) -> List[Dict[str
                 "chunk": hit.get("chunk", 0),
                 "score": round(float(score), 4),
                 "text": hit.get("text", ""),
+                "title": hit.get("title"),
+                "section": hit.get("section"),
+                "char_start": hit.get("char_start"),
+                "char_end": hit.get("char_end"),
             }
         )
     return results[:top_k]
+
+
+def _xml_attr(value: Any) -> str:
+    """Escape a value used in a double-quoted attribute of the context block."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _format_context_block(hits: List[Dict[str, Any]]) -> str:
@@ -320,10 +336,18 @@ def _format_context_block(hits: List[Dict[str, Any]]) -> str:
         "<knowledge_base>",
     ]
     for index, hit in enumerate(hits, 1):
-        lines.append(
-            f'<document index="{index}" source="{hit["file"]}" '
-            f'relevance="{hit["score"]}">'
-        )
+        attrs = [
+            f'index="{index}"',
+            f'source="{_xml_attr(hit["file"])}"',
+            f'relevance="{hit["score"]}"',
+        ]
+        if hit.get("title"):
+            attrs.append(f'title="{_xml_attr(hit["title"])}"')
+        if hit.get("section"):
+            attrs.append(f'section="{_xml_attr(hit["section"])}"')
+        if hit.get("char_start") is not None:
+            attrs.append(f'chars="{hit["char_start"]}-{hit.get("char_end", "")}"')
+        lines.append(f'<document {" ".join(attrs)}>')
         lines.append(hit.get("text", ""))
         lines.append("</document>")
     lines.append("</knowledge_base>")
@@ -361,10 +385,17 @@ def _rag_headers(hits: List[Dict[str, Any]]) -> Dict[str, str]:
     headers = {"X-RAG-Hits": str(len(hits))}
     if hits:
         # Only metadata goes into the header - document text stays in the prompt.
-        public = [
-            {"file": hit["file"], "chunk": hit["chunk"], "score": hit["score"]}
-            for hit in hits
-        ]
+        public = []
+        for hit in hits:
+            item = {
+                "file": hit["file"],
+                "chunk": hit["chunk"],
+                "score": hit["score"],
+            }
+            for key in ("title", "section", "char_start", "char_end"):
+                if hit.get(key) is not None:
+                    item[key] = hit[key]
+            public.append(item)
         payload = json.dumps(public, ensure_ascii=True, separators=(",", ":")).encode()
         headers["X-RAG-Sources"] = base64.urlsafe_b64encode(payload).decode().rstrip("=")
     return headers

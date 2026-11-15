@@ -16,6 +16,8 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from chunking import TextChunk
+
 log = logging.getLogger("embedder.db")
 
 
@@ -77,17 +79,22 @@ class VectorDB:
     def upsert(
         self,
         file_path: str,
-        chunks: List[str],
+        chunks: List[TextChunk],
         vectors: np.ndarray,
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """upsert chunks->vectors. vectors: numpy array shape (n, dim)
 
         `meta` is copied into every payload so the indexer can later tell whether
-        a file is still up to date (mtime/size/chunking config/model).
+        a file is still up to date (mtime/size/chunking config/model). Chunk
+        metadata (section and character offsets) is stored alongside the text.
         """
         if len(chunks) == 0:
             return
+        if len(chunks) != len(vectors):
+            raise ValueError(
+                f"Got {len(chunks)} chunks but {len(vectors)} vectors for {file_path}"
+            )
 
         dim = vectors.shape[1]
         # ensure collection
@@ -101,7 +108,15 @@ class VectorDB:
             points.append(
                 PointStruct(
                     id=pid,
-                    payload={"file": file_path, "chunk": i, "text": chunk, **extra},
+                    payload={
+                        **extra,
+                        "file": file_path,
+                        "chunk": i,
+                        "text": chunk.text,
+                        "section": chunk.section,
+                        "char_start": chunk.char_start,
+                        "char_end": chunk.char_end,
+                    },
                     vector=vec.tolist(),
                 )
             )

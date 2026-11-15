@@ -178,6 +178,10 @@ class SearchResult(BaseModel):
     text: str
     file: str
     chunk: int
+    title: Optional[str] = None
+    section: Optional[str] = None
+    char_start: Optional[int] = None
+    char_end: Optional[int] = None
 
 
 @app.post("/search", response_model=List[SearchResult])
@@ -208,6 +212,10 @@ async def search(request: SearchRequest):
                 text=payload.get("text", ""),
                 file=payload.get("file", "unknown"),
                 chunk=payload.get("chunk", 0),
+                title=payload.get("title"),
+                section=payload.get("section"),
+                char_start=payload.get("char_start"),
+                char_end=payload.get("char_end"),
             )
         )
 
@@ -386,6 +394,10 @@ async def collection_sample(limit: int = 5):
                     "id": point.id,
                     "file": payload.get("file", "unknown"),
                     "chunk": payload.get("chunk", 0),
+                    "title": payload.get("title"),
+                    "section": payload.get("section"),
+                    "char_start": payload.get("char_start"),
+                    "char_end": payload.get("char_end"),
                     "text_preview": f"{text[:100]}..." if text else "",
                 }
             )

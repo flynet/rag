@@ -24,7 +24,7 @@ This is the state of the code in this repository, not a target design.
 | Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
 | Reranking | None |
 | Hybrid / sparse search | None |
-| Chunking | Fixed 1024 characters with 128-character overlap |
+| Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
 | Indexing | Startup reconciliation + scan, `watchdog`, signature-based incremental updates |
 | Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
 | Qdrant | `qdrant/qdrant:latest`, no snapshot schedule |
@@ -38,6 +38,7 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 
 - OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/v1/embeddings`
 - Automatic document indexing with file-change monitoring
+- Structure-aware chunking with section paths and character offsets for citations
 - RAG enabled by default: retrieved chunks are injected into the current user turn
 - Transparent passthrough of `tools`, `tool_calls`, `response_format`, `temperature`, and other OpenAI fields
 - Bearer authentication with static keys
@@ -99,6 +100,7 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 ├── embedder/                    # indexer: watchdog + HTTP client (no torch)
 │   ├── Dockerfile
 │   ├── main.py                  # watcher, worker, incremental indexing
+│   ├── chunking.py              # structure-aware splitter + citation metadata
 │   ├── embedder.py              # HTTP client for api
 │   ├── vector_db.py             # Qdrant client wrapper
 │   └── requirements.txt
@@ -333,7 +335,9 @@ The response body stays strictly OpenAI-compatible, so retrieved sources are ret
 | Header | Value |
 |---|---|
 | `X-RAG-Hits` | number of injected chunks |
-| `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score"}]` |
+| `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score","title?","section?","char_start?","char_end?"}]` |
+
+`title`, `section`, and character offsets are included when the indexed chunk has them (chunks indexed before the structure-aware chunker may not).
 
 Decoding:
 
@@ -360,7 +364,7 @@ Context is injected only for a "fresh" user turn — when the last message in `m
 
 If the `api` service is unavailable, the gateway does **not** break chat: the request goes to the LLM without context and a `WARNING` is logged.
 
-**Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
+**Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, and `chars="start-end"` attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
 ### `POST /v1/embeddings`
 
@@ -529,9 +533,13 @@ The indexer:
 1. reconciles the index with the filesystem at startup: vectors for files that no longer exist under `data/documents` (deleted or renamed while the stack was stopped) are removed;
 2. scans `data/documents` and queues every existing file;
 3. watches for changes with `PollingObserver` and a 1-second debounce;
-4. skips files whose signature matches the stored one (`mtime`, size, chunk size, overlap, model);
-5. splits changed files into 1024-character chunks with 128-character overlap;
-6. deletes the file's old vectors and upserts the new ones.
+4. skips files whose signature matches the stored one (`mtime`, size, chunk size, overlap, chunker version, model);
+5. splits changed files with the structure-aware chunker: Markdown ATX headings and blank-line paragraphs first, then sentences, then whitespace; chunks are capped at 1024 characters and overlap by up to 128;
+6. prepends the document title (first heading or first line) to each chunk before embedding;
+7. stores the original chunk text plus `title`, `section`, `char_start`, and `char_end` in the payload;
+8. deletes the file's old vectors and upserts the new ones.
+
+The chunker version is part of the file signature, so changing the splitting algorithm re-indexes existing documents. Character offsets refer to the normalized text (CRLF/CR converted to LF).
 
 Logs:
 
@@ -569,7 +577,7 @@ Other decisions:
 
 - **fp16 instead of fp32** — half the weights and faster on tensor cores. On CPU, precision is forced to fp32 because fp16 is slow and unsupported by many ops.
 - **Vector normalization** (`EMBEDDING_NORMALIZE`, default `true`) — more stable cosine search.
-- **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `model`); unchanged files are skipped at startup and on watcher events.
+- **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `chunking_version`, `model`); unchanged files are skipped at startup and on watcher events.
 - **Batching** — texts are sent to `api` in `EMBED_BATCH_SIZE` batches instead of the whole file at once.
 - **Memory limits** — `mem_limit` of 1 GB for `embedder` and 512 MB for `gateway` prevents runaway indexing from consuming the host.
 - **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — less VRAM fragmentation.
@@ -588,7 +596,7 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 - **No labelled evaluation set yet** — `scripts/eval_retrieval.py` is in place, but `RAG_TOP_K` and `RAG_MIN_SCORE` are not yet tuned against real questions.
 - **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
 - **No reranker** — the top-`k` dense results go straight into the prompt.
-- **Fixed-size chunking** — no heading/paragraph awareness and no section metadata for citations.
+- **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
 - **No API/Qdrant healthchecks** — `depends_on` does not wait for readiness; Qdrant is pulled as `latest`.
 - **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
 - **Multi-turn follow-ups** — only the last user message is embedded, so elliptical questions ("what about the second one?") retrieve poorly.
@@ -648,11 +656,12 @@ docker compose restart gateway
 Code map:
 
 - `gateway/main.py` — `require_api_key`, `_rag_search`, `_inject_context`, `/v1/chat/completions`, `/v1/embeddings`
-- `api/main.py` — `/search` (Qdrant `query_points`, with a fallback to the older `search`), `/embed`, `/v1/embeddings`
+- `api/main.py` — `/search` (Qdrant `query_points`, with a fallback to the older `search`) returning citation metadata, `/embed`, `/v1/embeddings`
 - `api/embedder.py` — `Embedder`: fp16 loading, batching, normalization, query prompt
-- `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature`, `split_text_into_chunks`
+- `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature`
+- `embedder/chunking.py` — `split_text_into_chunks`, `TextChunk`, heading/section metadata and offsets
 - `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
-- `embedder/vector_db.py` — `VectorDB`: upsert with a file signature, `is_up_to_date`, collection recreation on dimension change
+- `embedder/vector_db.py` — `VectorDB`: upsert with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`, collection recreation on dimension change
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
 - `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR, nDCG) against a JSONL question set
 

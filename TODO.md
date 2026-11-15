@@ -103,16 +103,16 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Notes:** reranking 50 candidates with a 0.6B cross-encoder costs more than embedding one query; measure before enabling by default. Consider running the reranker on CPU if VRAM is tight.
 
-### [ ] P1.2 Structure-aware chunking + citation metadata
+### [~] P1.2 Structure-aware chunking + citation metadata
 
-**Why:** fixed 1024-character chunks cut through headings and sentences; payload has only `file` and `chunk`.
+**Why:** fixed 1024-character chunks cut through headings and sentences; payload had only `file` and `chunk`.
 
 **Scope:**
-- [ ] Split on headings/paragraphs first, then fall back to a size limit with overlap.
-- [ ] Prepend the document title (file name or first heading) to each chunk before embedding.
-- [ ] Store `section`, `char_start`, `char_end` in the payload.
-- [ ] Keep deterministic chunk IDs; include the chunking version in the file signature.
-- [ ] Update `scripts/smoke_test.py` / docs for the new payload fields.
+- [x] Split on headings/paragraphs first, then fall back to a size limit with overlap.
+- [x] Prepend the document title (file name or first heading) to each chunk before embedding.
+- [x] Store `title`, `section`, `char_start`, `char_end` in the payload.
+- [x] Keep deterministic chunk IDs; include the chunking version in the file signature.
+- [x] Update docs and expose the metadata through `/search`, `/collection/sample`, and `X-RAG-Sources`.
 - [ ] Re-index the corpus and re-run the evaluation.
 
 **Acceptance criteria:**
@@ -120,7 +120,7 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 - Citations can point to a section and character range.
 - Evaluation improves or stays flat; indexing time is acceptable.
 
-**Notes:** `file_signature` must include the chunker version, otherwise changing the algorithm will not trigger re-indexing.
+**Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. Remaining work: run with Docker, re-index, and compare against the evaluation baseline. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words) but not yet by the live pipeline.
 
 ### [ ] P1.3 Multi-turn query rewriting
 

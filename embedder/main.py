@@ -15,6 +15,7 @@ from typing import Any, Dict
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
+from chunking import CHUNKER_VERSION, document_title, split_text_into_chunks
 from embedder import RemoteEmbedder
 from vector_db import VectorDB
 
@@ -37,22 +38,7 @@ EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "unknown")
 
 
-# --- helper chunking ---
-def split_text_into_chunks(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    L = len(text)
-    while start < L:
-        end = min(start + chunk_size, L)
-        chunks.append(text[start:end])
-        if end == L:
-            break
-        start = max(0, end - overlap)
-    return chunks
-
-
+# --- indexing signature ---
 def file_signature(path: Path) -> Dict[str, Any]:
     """Всё, что влияет на результат индексации конкретного файла."""
     stat = path.stat()
@@ -61,6 +47,7 @@ def file_signature(path: Path) -> Dict[str, Any]:
         "size": int(stat.st_size),
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
+        "chunking_version": CHUNKER_VERSION,
         "model": EMBEDDING_MODEL,
     }
 
@@ -150,7 +137,14 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                 log.warning("Error reading file %s: %s", file_path, exc)
                 continue
 
-            chunks = split_text_into_chunks(text)
+            title = document_title(text, path)
+            chunks = split_text_into_chunks(
+                text,
+                CHUNK_SIZE,
+                CHUNK_OVERLAP,
+                path=path,
+                title=title,
+            )
             if not chunks:
                 log.info("No chunks to process for %s", file_path)
                 continue
@@ -162,13 +156,21 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                 log.warning("Error deleting old vectors for %s: %s", file_path, exc)
 
             try:
-                vectors = await embedder.embed(chunks)
+                # The document title is embedded with every chunk; the payload
+                # keeps the original chunk text and citation offsets.
+                embedding_inputs = [chunk.embedding_text(title) for chunk in chunks]
+                vectors = await embedder.embed(embedding_inputs)
             except Exception as exc:
                 log.error("Embedding error for %s: %s", file_path, exc)
                 continue
 
             try:
-                vector_db.upsert(file_path, chunks, vectors, meta=signature)
+                vector_db.upsert(
+                    file_path,
+                    chunks,
+                    vectors,
+                    meta={**signature, "title": title},
+                )
                 log.info("Upserted %d chunks for %s", len(chunks), file_path)
             except Exception as exc:
                 log.error("Upsert error for %s: %s", file_path, exc)

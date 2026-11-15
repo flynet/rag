@@ -121,6 +121,14 @@ def main() -> int:
     sources = decode_sources(response.headers)
     print(f"        X-RAG-Hits={response.headers.get('X-RAG-Hits')} sources={sources}")
     check("RAG sources header present", response.headers.get("X-RAG-Hits") is not None)
+    check(
+        "RAG sources entries are valid",
+        all(
+            isinstance(source, dict) and {"file", "chunk", "score"} <= set(source)
+            for source in sources
+        ),
+        str(sources),
+    )
 
     print("[5/5] POST /v1/chat/completions (stream, X-RAG: off)")
     chunks = 0
