@@ -1,0 +1,14 @@
+# Runtime data (never commit)
+models/
+qdrant_data/
+data/documents/*
+!data/documents/example.txt
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

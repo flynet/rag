@@ -8,31 +8,30 @@ services:
     volumes:
       - ./qdrant_data:/qdrant/storage
 
+  # Watchdog + Qdrant writer. No torch, no CUDA, no model:
+  # vectors are requested over HTTP from `api`.
   embedder:
     build: ./embedder
-    container_name: rag-embedder
+    container_name: embedder
     restart: always
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     volumes:
       - ./data:/data:rw
-      - ./models:/models:ro
     depends_on:
       - qdrant
+      - api
     environment:
-      - MODEL_PATH=/models/gemma-2-2b-it
+      - API_URL=http://api:8000
       - WATCH_PATH=/data/documents
       - DEBOUNCE_SEC=1.0
+      - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-google/embeddinggemma-300m}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    mem_limit: 1g
 
-  rag_api:
-    build: ./rag_api
-    container_name: rag-api
+  # The single owner of the embedding model (fp16 on GPU).
+  api:
+    build: ./api
+    container_name: api
     restart: always
     runtime: nvidia
     deploy:
@@ -43,62 +42,59 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "8000:8000"
+      - "8000:8000"   # debug only (Swagger at /docs) - agents talk to gateway
     volumes:
-      - ./models:/models:ro
+      - ./models:/models:rw          # also the HF cache (HF_HOME below)
     depends_on:
       - qdrant
-      - embedder
     environment:
-      - MODEL_PATH=/models/gemma-2-2b-it
+      - MODEL_PATH=${EMBEDDING_MODEL:-google/embeddinggemma-300m}
+      - HF_HOME=/models/hf-cache
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cuda}
+      - EMBEDDING_DTYPE=${EMBEDDING_DTYPE:-float16}
+      - EMBEDDING_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
+      - EMBEDDING_MODEL_NAME=rag-embeddings
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - COLLECTION_NAME=documents
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./ollama_data:/root/.ollama
-
-  rag_middleware:
-    build: ./rag_middleware
-    container_name: rag-middleware
+  # The only service agents need to talk to: OpenAI-compatible API with RAG.
+  # Base URL: http://localhost:8001/v1
+  #
+  # The LLM itself lives behind UPSTREAM_BASE_URL - a self-hosted
+  # OpenAI-compatible server (vLLM / LM Studio / llama.cpp), usually on another
+  # machine. UPSTREAM_API_KEY stays inside this container and is never exposed
+  # to agents.
+  gateway:
+    build: ./gateway
+    container_name: gateway
     restart: unless-stopped
     ports:
       - "8001:8001"
     depends_on:
-      - ollama
-      - rag_api
+      - api
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - RAG_API_URL=http://rag-api:8000
-      - RAG_TOP_K=3
-      - ENABLE_RAG=true
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    volumes:
-      - ./webui_data:/app/backend/data
-    depends_on:
-      - rag_middleware
-    environment:
-      - OLLAMA_BASE_URL=http://rag-middleware:8001
-      - WEBUI_SECRET_KEY=your-secret-key-change-this
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
+      - UPSTREAM_HEADERS=${UPSTREAM_HEADERS:-}
+      - API_URL=http://api:8000
+      - ENABLE_RAG=${ENABLE_RAG:-true}
+      - RAG_TOP_K=${RAG_TOP_K:-3}
+      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.5}
+      - UPSTREAM_TIMEOUT=${UPSTREAM_TIMEOUT:-600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Comma-separated bearer tokens. Empty = authentication disabled.
+      - API_KEYS=${API_KEYS:-}
+    mem_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
