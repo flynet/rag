@@ -182,15 +182,29 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. E2E (`docker compose up` with the GPU stack) is still pending because Docker Desktop is not running here.
 
-### [ ] P2.3 Qdrant snapshots and restore
+### [~] P2.3 Qdrant snapshots and restore — implemented, restore test pending live run
 
 **Why:** the index can be rebuilt, but that costs GPU time and a full re-index.
 
+**Status:** `scripts/qdrant_snapshot.py` (stdlib only) implements `create`, `list`,
+`download`, `delete`, `prune`, `status` and `restore` over the Qdrant REST API. `create`
+downloads the snapshot into `./backups/` (git-ignored) so the copy survives a container
+rebuild, and prunes the oldest node snapshots with `--keep` (default 5). `restore` uploads
+the file with a sha256 checksum (`POST /collections/{name}/snapshots/upload`), prints the
+collection state before and after, and refuses to run without `--yes` because it overwrites
+the collection. The README documents the procedure, retention and caveats (version pin,
+restore with `embedder` stopped, full snapshots restored via the `--snapshot` boot flag).
+**Verified:** the protocol against a local stub Qdrant (create → download → prune → list →
+restore into a fresh collection, restore guard without `--yes`, node checksum rejection,
+missing file). **Not verified:** restore against a real Qdrant container.
+
 **Scope:**
-- [ ] Document and script a snapshot procedure (`POST /collections/{name}/snapshots` or stop-and-copy of `qdrant_data`).
-- [ ] Define retention (e.g. keep the last N snapshots).
-- [ ] Perform and document a restore test.
-- [ ] Optionally add a scheduled snapshot job.
+- [x] Document and script a snapshot procedure (`POST /collections/{name}/snapshots?wait=true`, download, prune)
+- [x] Define retention (keep the last N snapshots on the node, `--keep`, default 5)
+- [x] Keep a copy outside the volume (`backups/`, git-ignored) so it survives a container rebuild
+- [x] Document the restore procedure (upload endpoint, checksum, `--yes` guard, caveats)
+- [ ] Perform and document a restore test (`E2E: docker required`)
+- [ ] Optionally add a scheduled snapshot job with a checksum and an off-host copy
 
 **Acceptance criteria:**
 - A snapshot can be restored into a fresh Qdrant instance.

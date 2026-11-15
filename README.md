@@ -22,6 +22,7 @@ This is the state of the code in this repository, not a target design.
 | Document encoding | Plain text, no instruction |
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
 | Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
+| Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding |
 | Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
 | Reranking | None |
 | Hybrid / sparse search | None |
@@ -117,11 +118,13 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 │   └── requirements.txt
 ├── scripts/
 │   ├── smoke_test.py            # end-to-end API check
-│   └── eval_retrieval.py        # retrieval quality evaluation
+│   ├── eval_retrieval.py        # retrieval quality evaluation
+│   └── qdrant_snapshot.py       # backup and restore of the Qdrant index
 ├── eval/
 │   ├── README.md                # dataset format and metrics
 │   └── questions.example.jsonl  # schema examples
 ├── qdrant_data/                 # vector DB data (created automatically)
+├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
 └── TODO.md
 ```
@@ -169,6 +172,48 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 - **Dashboard:** http://localhost:6333/dashboard
 - **Version:** pinned to `v1.20.1` via `QDRANT_VERSION` in `.env`. Bump it deliberately: take a snapshot and verify the storage format before changing the tag.
 - **Healthcheck:** TCP connect to `127.0.0.1:6333` (the official image has no `curl`/`wget`); `api` and `embedder` wait for it with `depends_on: condition: service_healthy`.
+
+#### Backups and restore (snapshots)
+
+A Qdrant snapshot is a complete copy of the collection: points, vectors and metadata. Restoring it rebuilds the index **without re-embedding** the corpus, so a full re-index (GPU time for every chunk) is not needed.
+
+```bash
+# create a snapshot on the Qdrant node and download it into ./backups
+python scripts/qdrant_snapshot.py create          # keeps the 5 newest snapshots on the node
+python scripts/qdrant_snapshot.py list            # snapshots stored on the node
+python scripts/qdrant_snapshot.py status          # collection status, points, dimension
+python scripts/qdrant_snapshot.py prune --keep 3  # delete the oldest node snapshots
+python scripts/qdrant_snapshot.py delete --snapshot NAME
+```
+
+Snapshots created via REST are stored by the node in `qdrant_data/snapshots/documents/` on the host, and `create` downloads a copy into `./backups/` so it survives a container rebuild. Keep the downloaded copy off the machine (cloud, NAS, external disk): a backup inside the folder that gets deleted with the container is not a backup.
+
+Restore replaces the collection data, so it requires an explicit confirmation. Restoring into
+a running stack:
+
+```bash
+# restore into a running stack (overwrites the collection)
+docker compose stop embedder                      # the indexer must not write during restore
+docker compose up -d qdrant api                   # qdrant and api must be up and healthy
+python scripts/qdrant_snapshot.py restore --file backups/documents-....snapshot --yes
+docker compose up -d embedder
+python scripts/smoke_test.py                      # search must return results
+```
+
+Restoring into a fresh Qdrant instance: start only `qdrant` (an empty `qdrant_data/` is fine),
+run the same `restore` command, then check `status` shows the expected `points` and `dim`
+before starting `api` and `embedder`.
+
+The upload endpoint (`POST /collections/documents/snapshots/upload`) verifies the sha256 checksum, creates the collection if it does not exist, and overwrites everything stored on the node for that collection. The tool prints the collection state before and after (`points`, `dim`), and refuses to run without `--yes`.
+
+Caveats:
+
+- **Version:** restore into the same Qdrant image version (the pinned `QDRANT_VERSION`); older servers cannot read storage written by newer ones.
+- **Re-index comparison:** a snapshot restore takes seconds; a full re-index of a corpus costs one embedding pass over every chunk on GPU.
+- **After restore:** `embedder` re-verifies file signatures on startup, so unchanged files are not re-indexed. Files changed while the index was stale remain out of date; check `embedder` logs.
+- **Full-storage snapshots** (`POST /snapshots`, `GET /snapshots`) cover all collections at once; they are restored by starting Qdrant with the `--snapshot <path>` flag at boot, not through REST.
+- **Offline:** `embedder` and `api` must be stopped while restoring, and retrieval is unavailable during restore.
+- The script is stdlib-only (no extra dependencies) and needs only `6333` reachable.
 
 ### Startup order
 
@@ -685,6 +730,7 @@ Code map:
 - `embedder/vector_db.py` — `VectorDB`: upsert with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`, collection recreation on dimension change
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
 - `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR, nDCG) against a JSONL question set
+- `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
 There is no unit-test suite yet; `scripts/smoke_test.py` is the end-to-end check and `scripts/eval_retrieval.py` measures retrieval quality. See [eval/README.md](eval/README.md) for the dataset format.
 
@@ -708,6 +754,7 @@ The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
 
 - [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
 - [Qdrant Documentation](https://qdrant.tech/documentation/)
+- [Qdrant snapshots (backup and restore)](https://qdrant.tech/documentation/snapshots/)
 - [Qwen3-Embedding-0.6B model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
 - [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
 - [LM Studio local server](https://lmstudio.ai/docs/app/api)
