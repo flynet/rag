@@ -122,20 +122,33 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 
 **Notes:** implemented in `VectorDB.reconcile_files()` and called before the startup scan. Live evidence from the running stack: deleting a file logged `File disappeared (deleted?)` and `Deleted vectors for /data/documents/Text Document.txt`; a queued index job raced the delete and left one orphaned chunk, which was removed with a filtered `points/delete` (`points_count` 193 → 192). The delete-while-stopped acceptance run is still to be done, together with the rename case. Keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
 
-### [ ] P0.3 Tune `RAG_TOP_K` / `RAG_MIN_SCORE`
+### [x] P0.3 Tune `RAG_TOP_K` / `RAG_MIN_SCORE`
 
 **Why:** `3` and `0.5` are inherited defaults, not measured values. Qwen3-Embedding has a different score distribution than embeddinggemma.
 
 **Scope:**
 - [x] Run the evaluation harness for `top_k` ∈ {3, 5, 8, 10}.
 - [x] Run it for `min_score` ∈ {0.3, 0.4, 0.5, 0.6} (and with the threshold disabled).
-- [ ] Check query-prompt on/off (`EMBEDDING_QUERY_PROMPT=query` vs empty) on the same set.
-- [ ] Sweep the follow-up set (`eval/questions.multiturn.jsonl`) in gateway mode with the same grid.
-- [ ] Record the chosen values in `.env.example` and README.
+- [x] Check query-prompt on/off (`EMBEDDING_QUERY_PROMPT=query` vs empty) on the same set.
+- [x] Sweep the follow-up set (`eval/questions.multiturn.jsonl`) in gateway mode with the same grid.
+- [x] Record the chosen values in `.env.example` and README.
 
 **Acceptance criteria:**
-- Chosen values are justified by the evaluation table, not intuition.
+- Chosen values are justified by the evaluation table, not intuition. *(met: `eval/sweep.md`, `eval/sweep-prompt-off.md`, `eval/sweep-multiturn.md`)*
 - README states that the threshold is model-dependent and how to re-tune it.
+
+**Notes:** chosen `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3`, applied to gateway defaults,
+`.env.example` and README. Single-turn set (60 questions, 202 chunks): `top_k=3`
+recovers only 0.500 of the answers, `top_k=8` recovers 0.783; `min_score=0.5` cuts
+recall@8 to 0.483 and leaves 23% of questions with no context, `0.6` leaves 52%.
+`0.3` costs nothing over the disabled threshold, so it is the safe operating point.
+Query prompt on/off: on = recall@8 0.783 / MRR@10 0.414, off = recall@8 0.683 /
+MRR@10 0.455; the prompt is kept on because coverage at `top_k=8` is what the
+injection budget needs. Follow-up set (9 conversations, gateway, rewrite off):
+`min_score=0.5` leaves 33% of follow-ups with no context and recall@8 0.333,
+`0.3` keeps recall@8 0.667 with 0% zero-context — the same threshold is safe for
+conversations, `0.5` is not. Re-run `--sweep` after any model, chunking, or
+query-prompt change; the numbers are not transferable.
 
 ---
 

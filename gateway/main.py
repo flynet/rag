@@ -104,9 +104,9 @@ UPSTREAM_HEADERS: Dict[str, str] = _env_headers("UPSTREAM_HEADERS")
 API_URL = os.environ.get("API_URL", "http://api:8000").rstrip("/")
 
 ENABLE_RAG = _env_bool("ENABLE_RAG", True)
-RAG_TOP_K = _env_int("RAG_TOP_K", 3)
+RAG_TOP_K = _env_int("RAG_TOP_K", 8)
 RAG_MAX_TOP_K = _env_int("RAG_MAX_TOP_K", 20)
-RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", 0.5)
+RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", 0.3)
 RAG_TIMEOUT = _env_float("RAG_TIMEOUT", 30.0)
 
 # Follow-up query handling: off | concat | llm. "concat" joins previous user

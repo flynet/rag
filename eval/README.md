@@ -159,6 +159,38 @@ query-side instruction is part of the configuration, so compare
 `EMBEDDING_QUERY_PROMPT=query` with `EMBEDDING_QUERY_PROMPT=` (two runs, with
 `docker compose up -d api` between them) and keep the value that wins.
 
+### The tuning record
+
+The sweeps that produced the committed values are kept in the repository:
+
+| File | Configuration | Result |
+|---|---|---|
+| `eval/sweep.md` + `eval/baseline.json` | `EMBEDDING_QUERY_PROMPT=query`, 60 questions | `top_k=8` + `min_score=0.3`: recall@8 `0.783`, zero-context `0%` |
+| `eval/sweep-prompt-off.md` + `eval/baseline-prompt-off.json` | `EMBEDDING_QUERY_PROMPT=` (no instruction), 60 questions | best recall@8 `0.683`, MRR@10 `0.455` — lower coverage, higher top-3 precision |
+| `eval/sweep-multiturn.md` + `eval/multiturn-gateway.json` | 9 follow-up conversations, gateway mode, rewrite off | `min_score=0.3`: recall@8 `0.667`, zero-context `0%`; `0.5`: recall@8 `0.333`, zero-context `33%` |
+
+`RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` is the choice all three tables support. The
+follow-up table is the binding one: an elliptical question ("and the min score?")
+embeds weakly, so a threshold tuned on single-turn questions alone silently
+strips the context of real conversations.
+
+Reproduce the record from a fresh clone:
+
+```powershell
+Copy-Item eval/corpus/* data/documents/
+docker compose up -d                    # re-embeds the corpus, 202 chunks
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --sweep \
+    --sweep-md eval/sweep.md --json-out eval/baseline.json
+# then disable the query prompt and run again (no re-index: the prompt is
+# query-side only). Set EMBEDDING_QUERY_PROMPT= in .env, then:
+docker compose up -d api
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --sweep \
+    --sweep-md eval/sweep-prompt-off.md --json-out eval/baseline-prompt-off.json
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl \
+    --mode gateway --sweep --sweep-md eval/sweep-multiturn.md \
+    --json-out eval/multiturn-gateway.json
+```
+
 ## Metrics
 
 - **recall@k** — fraction of questions with at least one relevant hit in the top `k`.
@@ -209,8 +241,14 @@ added.
 
 ## Notes
 
-- `eval/baseline.json` and `eval/sweep.md` are generated, not hand-written.
-  Commit them after a deliberate quality change so regressions are visible later.
+- `eval/baseline.json` (search mode: metrics, per-question ranks, sweep grid) and
+  `eval/multiturn-gateway.json` (gateway mode: follow-up retrieval) are generated
+  by `--json-out`, not hand-written. Commit them after a deliberate quality change
+  so regressions are visible later.
+- The harness reuses **one keep-alive connection** for the whole run. On Windows a
+  fresh TCP connection to a Docker-published port costs ~20 s, so opening one per
+  question turns a 60-question run into ~20 minutes of connection setup; reusing
+  the connection makes the same run take ~30 s.
 - The API must be running with the same embedding model, corpus and chunking as
   the deployment you are evaluating.
 - The question set may contain domain data; review it before publishing the

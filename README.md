@@ -20,10 +20,10 @@ This is the state of the code in this repository, not a target design.
 | Embedding model | `Qwen/Qwen3-Embedding-0.6B`, 1024 dimensions, fp16 on GPU |
 | Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
 | Document encoding | Plain text, no instruction |
-| Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
+| Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=8`, `RAG_MIN_SCORE=0.3` (measured with `--sweep`) |
 | Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
 | Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
-| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557` |
+| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; one keep-alive connection per run; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557` |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
@@ -128,16 +128,23 @@ implemented yet.
 ├── scripts/
 │   ├── smoke_test.py            # end-to-end API check
 │   ├── eval_retrieval.py        # retrieval quality evaluation + top_k/min_score sweep
+│   ├── latency_probe.py         # p50/p95 of search while the indexer is busy
 │   └── qdrant_snapshot.py       # backup and restore of the Qdrant index
 ├── eval/
-│   ├── README.md                # dataset format, modes, sweep, metrics
+│   ├── README.md                # dataset format, modes, sweep, metrics, tuning record
 │   ├── questions.jsonl          # the 60-question baseline dataset
+│   ├── questions.multiturn.jsonl# 9 follow-up conversations (history + short question)
 │   ├── questions.example.jsonl  # schema examples
 │   ├── corpus/                  # snapshot of the documents the baseline is measured on
 │   ├── baseline.json            # committed baseline numbers + sweep grid
-│   └── sweep.md                 # top_k × min_score tables and the chosen defaults
+│   ├── baseline-prompt-off.json # the same set with the query prompt disabled
+│   ├── multiturn-gateway.json   # follow-up retrieval through the gateway
+│   ├── sweep.md                 # top_k × min_score tables for the chosen defaults
+│   ├── sweep-prompt-off.md      # the same grid without the query instruction
+│   ├── sweep-multiturn.md       # the same grid on follow-up conversations
+│   └── perf-probe.json          # measured search latency under ingest
 ├── tests/
-│   └── test_eval_metrics.py     # unit tests for the evaluation math (no GPU/API needed)
+│   └── test_eval_metrics.py     # unit tests for the eval math (no GPU/API needed)
 ├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
@@ -500,7 +507,7 @@ Public, no authentication. Checks the model server and the `api` service.
   "status": "ok",
   "rag_enabled": true,
   "auth_required": true,
-  "defaults": {"top_k": 3, "min_score": 0.5},
+  "defaults": {"top_k": 8, "min_score": 0.3},
   "dependencies": {
     "upstream": {"url": "http://192.168.1.50:8000/v1", "ok": true, "status": 200},
     "api": {"url": "http://api:8000", "ok": true, "status": 200}
@@ -527,8 +534,8 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `EMBEDDING_MAX_SEQ_LENGTH` | `8192` | maximum tokens per text (the model supports 32k) |
 | `EMBED_BATCH_SIZE` | `32` | texts per embedding request (both indexing and API batching) |
 | `ENABLE_RAG` | `true` | global RAG switch |
-| `RAG_TOP_K` | `3` | default number of chunks in the context |
-| `RAG_MIN_SCORE` | `0.5` | default cosine-score threshold |
+| `RAG_TOP_K` | `8` | chunks injected into the prompt; measured value (sweep), not a default |
+| `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; measured value (sweep), model-dependent |
 | `RAG_QUERY_REWRITE` | `off` | follow-up query mode: `off`, `concat`, or `llm` |
 | `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
 | `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
@@ -617,7 +624,14 @@ EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 
 Changing the model invalidates the index because each chunk stores the model name in its payload. If the dimension changes (768 → 1024 when switching from embeddinggemma), the Qdrant collection is recreated automatically (`recreating the collection` in the log); if the dimension is the same, the collection is kept but all documents are still re-indexed. The full pass starts when `embedder` starts.
 
-Different models produce different cosine-score distributions, so re-check `RAG_MIN_SCORE` after a switch (0.5 is a reasonable starting point for Qwen3-Embedding). Use the evaluation harness from [TODO.md](TODO.md) to tune it.
+Different models produce different cosine-score distributions, so `RAG_MIN_SCORE` and `RAG_TOP_K` must be re-measured after a switch, not copied. One retrieval pass plus the sweep grid is enough:
+
+```bash
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --sweep --json-out eval/baseline.json
+```
+
+For `Qwen3-Embedding-0.6B` the sweep picked `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` (recall@8 `0.783`, zero-context `0%`). The inherited `RAG_TOP_K=3` / `RAG_MIN_SCORE=0.5` measured recall@8 `0.483` and left 23% of questions with no injected context at all. `min_score` above `0.4` is not usable on this model: it removes more context than it filters. See [eval/README.md](eval/README.md) for how to read the sweep table.
 
 The model is downloaded into `./models/hf-cache` on first start and is reused across container restarts. Old weights are not deleted automatically; after switching, you can remove `models--google--embeddinggemma-300m` to free ~0.6 GB.
 
@@ -792,7 +806,7 @@ The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
 |---|---|---|
 | P0 | Retrieval evaluation harness (recall@k, MRR, nDCG, sweep) | done, baseline committed |
 | P0 | Startup reconciliation of stale vectors | implemented, verification pending |
-| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set | pending |
+| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set | done, measured values committed |
 | P1 | Reranker (retrieve 30–50, pass 5–8) | pending |
 | P1 | Structure-aware chunking and citation metadata | done, re-indexed |
 | P1 | Multi-turn query rewriting | implemented, off by default |
