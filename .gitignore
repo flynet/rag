@@ -1,6 +1,7 @@
 # Runtime data (never commit)
 models/
 qdrant_data/
+qdrant_snapshots/
 backups/
 data/documents/*
 !data/documents/example.txt

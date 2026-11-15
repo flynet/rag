@@ -6,7 +6,16 @@ services:
     ports:
       - "6333:6333"
     volumes:
-      - ./qdrant_data:/qdrant/storage
+      # A named volume lives on ext4 inside the Docker Desktop VM. A bind mount from
+      # Windows goes through a 9p translation layer: Qdrant warns "cannot guarantee
+      # data safety" there and its WAL gets corrupted, so snapshots taken on a
+      # bind-mounted storage contain a broken first-index.
+      - qdrant_data:/qdrant/storage
+      # REST snapshots (`POST /collections/{name}/snapshots`) are written to
+      # /qdrant/snapshots, which is NOT inside the storage dir. Bind it so node
+      # snapshots survive container recreation, and keep the downloaded copies
+      # in ./backups as the portable artifact.
+      - ./qdrant_snapshots:/qdrant/snapshots
     healthcheck:
       # The official image is debian-slim and has no curl/wget. Bash's
       # /dev/tcp is enough to confirm that the HTTP port accepts connections.
@@ -138,3 +147,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  # Qdrant storage. Created automatically on `docker compose up`, stored on ext4
+  # in the Docker Desktop VM. Back it up with `python scripts/qdrant_snapshot.py`.
+  qdrant_data:
