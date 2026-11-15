@@ -23,7 +23,7 @@ This is the state of the code in this repository, not a target design.
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
 | Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
 | Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
-| Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
+| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; 60 questions + committed corpus; baseline `recall@5=0.65`, `recall@10=0.767`, `MRR@10=0.396`, `nDCG@10=0.526` |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
@@ -127,11 +127,17 @@ implemented yet.
 │   └── requirements.txt
 ├── scripts/
 │   ├── smoke_test.py            # end-to-end API check
-│   ├── eval_retrieval.py        # retrieval quality evaluation
+│   ├── eval_retrieval.py        # retrieval quality evaluation + top_k/min_score sweep
 │   └── qdrant_snapshot.py       # backup and restore of the Qdrant index
 ├── eval/
-│   ├── README.md                # dataset format and metrics
-│   └── questions.example.jsonl  # schema examples
+│   ├── README.md                # dataset format, modes, sweep, metrics
+│   ├── questions.jsonl          # the 60-question baseline dataset
+│   ├── questions.example.jsonl  # schema examples
+│   ├── corpus/                  # snapshot of the documents the baseline is measured on
+│   ├── baseline.json            # committed baseline numbers + sweep grid
+│   └── sweep.md                 # top_k × min_score tables and the chosen defaults
+├── tests/
+│   └── test_eval_metrics.py     # unit tests for the evaluation math (no GPU/API needed)
 ├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
@@ -139,6 +145,14 @@ implemented yet.
 ```
 
 Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this repo. It lives on ext4 inside the Docker Desktop VM; a Windows bind mount goes through a 9p translation layer, which Qdrant reports as `"Unrecognized filesystem - cannot guarantee data safety"` and where its WAL gets corrupted. The snapshots directory is bind-mounted so snapshot files created via REST survive container recreation.
+
+`data/documents/` is git-ignored, so the documents the baseline was measured on are committed under `eval/corpus/`. Reproduce the baseline from a fresh clone:
+
+```powershell
+Copy-Item eval/corpus/* data/documents/
+docker compose up -d          # re-embeds the corpus, 192 chunks
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus
+```
 
 ## Services
 
@@ -545,6 +559,7 @@ Set in `docker-compose.yaml`:
 | `MODEL_PATH` | `${EMBEDDING_MODEL}` | model id or local path |
 | `HF_HOME` | `/models/hf-cache` | Hugging Face cache inside the container |
 | `EMBEDDING_BATCH_SIZE` | `${EMBED_BATCH_SIZE}` | texts per forward pass |
+| `EMBEDDING_MAX_CONCURRENCY` | `${EMBEDDING_MAX_CONCURRENCY}` = `1` | encode calls allowed at once; `1` serializes them on the GPU so indexing and chat queue instead of competing for VRAM |
 | `EMBEDDING_NORMALIZE` | `true` | L2-normalize output vectors |
 | `EMBEDDING_MODEL_NAME` | `rag-embeddings` | `model` field returned by `/v1/embeddings` |
 | `MAX_BATCH_SIZE` | `256` | maximum texts per API request |
@@ -683,12 +698,12 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 
 ## Known limitations
 
-- **No labelled evaluation set yet** — `scripts/eval_retrieval.py` is in place, but `RAG_TOP_K` and `RAG_MIN_SCORE` are not yet tuned against real questions.
+- **Small, self-referential evaluation set** — 60 questions over the project's own documents (5 files, 192 chunks). Real user documents and a held-out subset are still missing; 14 of 60 questions have no expected hit in the top 10, concentrated on short table rows and config lines (dense search misses exact keys).
 - **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
 - **No reranker** — the top-`k` dense results go straight into the prompt.
 - **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
-- **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
-- **Multi-turn follow-ups** — supported via `RAG_QUERY_REWRITE=concat|llm`, but disabled by default until the evaluation set covers follow-ups.
+- **Single GPU service** — bulk indexing and user queries share the same model; encode calls are serialized by `EMBEDDING_MAX_CONCURRENCY` (default `1`), so indexing load shows up as search latency. No dynamic batching.
+- **Multi-turn follow-ups** — supported via `RAG_QUERY_REWRITE=concat|llm`, disabled by default; the harness measures follow-ups in `gateway` mode (`history` in the dataset), so the default stays off until the sweep on follow-ups is done.
 - **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
 - **Model-dependent threshold** — `RAG_MIN_SCORE` must be re-tuned after changing the embedding model.
 
@@ -755,26 +770,35 @@ Code map:
 - `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
 - `embedder/vector_db.py` — `VectorDB`: upsert with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`, collection recreation on dimension change
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
-- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR, nDCG) against a JSONL question set
+- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
-There is no unit-test suite yet; `scripts/smoke_test.py` is the end-to-end check and `scripts/eval_retrieval.py` measures retrieval quality. See [eval/README.md](eval/README.md) for the dataset format.
+Unit tests for the evaluation math (matching, metrics, sweep grid, dataset and corpus validation) run without GPU, API, or Docker:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+`scripts/smoke_test.py` is the end-to-end check of the live stack, and
+`scripts/eval_retrieval.py` measures retrieval quality. See
+[eval/README.md](eval/README.md) for the dataset format, the corpus snapshot, and
+how to read the sweep tables.
 
 ## Roadmap
 
 The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
 
-| Priority | Item |
-|---|---|
-| P0 | Retrieval evaluation harness (recall@k, MRR) |
-| P0 | Startup reconciliation of stale vectors |
-| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set |
-| P1 | Reranker (retrieve 30–50, pass 5–8) |
-| P1 | Structure-aware chunking and citation metadata |
-| P1 | Multi-turn query rewriting |
-| P2 | Hybrid BM25 + dense search with RRF |
-| P2 | Healthchecks, pinned Qdrant version, snapshots |
-| P3 | TEI/vLLM backend, query cache, quantization, larger model, pgvector |
+| Priority | Item | Status |
+|---|---|---|
+| P0 | Retrieval evaluation harness (recall@k, MRR, nDCG, sweep) | done, baseline committed |
+| P0 | Startup reconciliation of stale vectors | implemented, verification pending |
+| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set | pending |
+| P1 | Reranker (retrieve 30–50, pass 5–8) | pending |
+| P1 | Structure-aware chunking and citation metadata | done, re-indexed |
+| P1 | Multi-turn query rewriting | implemented, off by default |
+| P2 | Hybrid BM25 + dense search with RRF | pending |
+| P2 | Healthchecks, pinned Qdrant version, snapshots | done |
+| P3 | TEI/vLLM backend, query cache, quantization, larger model, pgvector | pending |
 
 ## Useful links
 

@@ -77,6 +77,9 @@ services:
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cuda}
       - EMBEDDING_DTYPE=${EMBEDDING_DTYPE:-float16}
       - EMBEDDING_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
+      # Encode calls allowed at once. 1 serializes them on the GPU so bulk
+      # indexing and chat queries queue instead of competing for VRAM.
+      - EMBEDDING_MAX_CONCURRENCY=${EMBEDDING_MAX_CONCURRENCY:-1}
       # Retrieval prompt name for queries (Qwen3-Embedding: "query").
       # Empty = encode queries without an instruction, like documents.
       - EMBEDDING_QUERY_PROMPT=${EMBEDDING_QUERY_PROMPT:-query}

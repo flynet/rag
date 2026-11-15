@@ -14,7 +14,6 @@ Public (gateway-facing) endpoints:
 import base64
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
 
@@ -29,42 +28,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("api")
 
-# Добавляем путь к embedder модулю (если нужно)
-sys.path.append("/app")
+from embedder import Embedder
 
-# Импортируем embedder из соседнего сервиса (будет через volume или копирование)
-try:
-    from embedder import Embedder
-except ImportError as exc:  # pragma: no cover
-    if os.environ.get("ALLOW_EMBEDDER_FALLBACK", "false").lower() in {"1", "true", "yes"}:
-        log.error("Embedder not found (%s) - using DUMMY embeddings", exc)
-
-        # Fallback для локальных тестов без GPU/модели.
-        class Embedder:
-            def __init__(
-                self,
-                model_path,
-                device="cpu",
-                dtype=None,
-                batch_size=32,
-                normalize=True,
-                max_seq_length=None,
-                query_prompt=None,
-            ):
-                # Qwen3-Embedding-0.6B produces 1024-dimensional vectors
-                self.dim = 1024
-                self.query_prompt = query_prompt
-                log.warning("Dummy embedder initialized (dim=%d)", self.dim)
-
-            async def embed(self, texts: List[str], prompt_name=None):
-                return np.random.randn(len(texts), self.dim).astype(np.float32)
-
-            async def embed_query(self, texts: List[str]):
-                return await self.embed(texts)
-    else:
-        raise
-
-# Настройки
+# Model configuration: one model instance for the whole system (see README)
 MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-Embedding-0.6B")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
@@ -72,17 +38,19 @@ COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "documents")
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "rag-embeddings")
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "256"))
 
-# Устройство и точность: один экземпляр модели на всю систему (см. README)
 EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "cuda")
 EMBEDDING_DTYPE = os.environ.get("EMBEDDING_DTYPE", "float16")
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "32"))
 EMBEDDING_NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "true").lower() in {"1", "true", "yes"}
 EMBEDDING_MAX_SEQ_LENGTH = int(os.environ.get("EMBEDDING_MAX_SEQ_LENGTH", "8192")) or None
-# Имя промпта для запросов: у Qwen3-Embedding это "query" с retrieval-инструкцией.
-# Пустое значение - кодировать запросы так же, как документы.
+# Query prompt name: Qwen3-Embedding has "query" with a retrieval instruction.
+# An empty value encodes queries exactly like documents.
 EMBEDDING_QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", "query").strip() or None
+# How many encode calls may run at once. 1 serializes them on the GPU, which
+# keeps VRAM and p95 latency predictable while indexing and chat share the model.
+EMBEDDING_MAX_CONCURRENCY = max(1, int(os.environ.get("EMBEDDING_MAX_CONCURRENCY", "1")))
 
-# Глобальные объекты (инициализируются при старте)
+# Global objects (initialized at startup)
 embedder = None
 qdrant_client = None
 
@@ -103,13 +71,14 @@ async def lifespan(_: FastAPI):
         normalize=EMBEDDING_NORMALIZE,
         max_seq_length=EMBEDDING_MAX_SEQ_LENGTH,
         query_prompt=EMBEDDING_QUERY_PROMPT,
+        max_concurrency=EMBEDDING_MAX_CONCURRENCY,
     )
 
     log.info("Startup complete")
     yield
 
 
-app = FastAPI(title="RAG Search API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="RAG Search API", version="2.1.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,23 +155,23 @@ class SearchResult(BaseModel):
 
 @app.post("/search", response_model=List[SearchResult])
 async def search(request: SearchRequest):
-    """Поиск релевантных документов по запросу."""
+    """Semantic search over the document collection."""
     if not _collection_exists():
         return []
 
-    # 1. Получаем embedding для запроса: с retrieval-инструкцией модели
-    #    (у Qwen3-Embedding - prompt_name="query").
+    # 1. Encode the query with the model's retrieval instruction
+    #    (Qwen3-Embedding: prompt_name="query").
     query_vectors = await _encode([request.query], query=True)
     query_vector = query_vectors[0].astype(float).tolist()
 
-    # 2. Ищем в Qdrant
+    # 2. Search in Qdrant
     hits = _query(query_vector, request.top_k, request.min_score)
 
-    # Дублируем фильтр локально, чтобы контракт /search не зависел от бэкенда
+    # Filter locally as well, so the /search contract does not depend on the backend
     if request.min_score is not None:
         hits = [hit for hit in hits if hit.score >= request.min_score]
 
-    # 3. Формируем ответ
+    # 3. Build the response
     response: List[SearchResult] = []
     for hit in hits:
         payload = hit.payload or {}
@@ -233,10 +202,10 @@ class EmbedRequest(BaseModel):
 
 @app.post("/embed")
 async def embed_texts(request: EmbedRequest):
-    """Внутренний эндпоинт: батч текстов -> векторы.
+    """Internal endpoint: a batch of texts -> vectors.
 
-    Единственный способ, которым `embedder` получает эмбеддинги, - поэтому
-    модель загружена ровно один раз на всю систему.
+    This is the only way `embedder` gets embeddings, so the model is loaded
+    exactly once for the whole system.
     """
     if len(request.texts) > MAX_BATCH_SIZE:
         raise HTTPException(
@@ -289,7 +258,7 @@ async def create_embeddings(request: EmbeddingsRequest):
             detail="'input' must contain only strings (token arrays are not supported)",
         )
 
-    # Пустая строка ломает некоторые модели - подменяем пробелом
+    # An empty string breaks some models - replace it with a space
     texts = [text if text.strip() else " " for text in texts]
 
     vectors = await _encode(texts)
@@ -334,7 +303,7 @@ async def create_embeddings(request: EmbeddingsRequest):
 async def health():
     try:
         collection_exists = _collection_exists() if qdrant_client is not None else False
-    except Exception:  # Qdrant недоступен - health должен всё равно ответить
+    except Exception:  # Qdrant is down - /health still answers
         collection_exists = False
 
     return {
@@ -345,6 +314,7 @@ async def health():
         "dtype": EMBEDDING_DTYPE,
         "dim": getattr(embedder, "dim", None),
         "query_prompt": getattr(embedder, "query_prompt", EMBEDDING_QUERY_PROMPT),
+        "max_concurrency": getattr(embedder, "max_concurrency", EMBEDDING_MAX_CONCURRENCY),
         "collection": COLLECTION_NAME,
         "collection_exists": collection_exists,
     }
@@ -352,7 +322,7 @@ async def health():
 
 @app.get("/collection/info")
 async def collection_info():
-    """Статистика коллекции: количество векторов, размерность и т.д."""
+    """Collection statistics: number of vectors, dimension, and so on."""
     try:
         if not _collection_exists():
             return {"collection_name": COLLECTION_NAME, "exists": False}
@@ -373,7 +343,7 @@ async def collection_info():
 
 @app.get("/collection/sample")
 async def collection_sample(limit: int = 5):
-    """Несколько точек коллекции для проверки индексации."""
+    """A few collection points, to check what indexing produced."""
     try:
         if not _collection_exists():
             return {"total_points": 0, "points": []}

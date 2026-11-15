@@ -25,12 +25,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("embedder")
 
-# Параметры (можно настроить через env)
+# Parameters (configurable through env)
 API_URL = os.environ.get("API_URL", "http://api:8000")
 WATCH_PATH = os.environ.get("WATCH_PATH", "/data/documents")
 DEBOUNCE_SEC = float(os.environ.get("DEBOUNCE_SEC", "1.0"))
 
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1024"))   # символы
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1024"))   # characters
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "128"))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 
@@ -39,13 +39,13 @@ EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 QDRANT_READY_ATTEMPTS = int(os.environ.get("QDRANT_READY_ATTEMPTS", "60"))
 QDRANT_READY_DELAY = float(os.environ.get("QDRANT_READY_DELAY", "2.0"))
 
-# Метка модели попадает в payload: при её смене индекс пересобирается
+# The model label is stored in the payload: changing it rebuilds the index
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "unknown")
 
 
 # --- indexing signature ---
 def file_signature(path: Path) -> Dict[str, Any]:
-    """Всё, что влияет на результат индексации конкретного файла."""
+    """Everything that changes the indexing result for a given file."""
     stat = path.stat()
     return {
         "mtime": int(stat.st_mtime_ns),
@@ -161,7 +161,7 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                 log.warning("Cannot stat %s: %s", file_path, exc)
                 continue
 
-            # Инкрементальная индексация: неизменившиеся файлы не пересчитываем
+            # Incremental indexing: unchanged files are not recomputed
             if vector_db.is_up_to_date(file_path, signature):
                 log.info("Unchanged, skipping %s", file_path)
                 continue
@@ -184,7 +184,7 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                 log.info("No chunks to process for %s", file_path)
                 continue
 
-            # Удаляем старые векторы, чтобы не остались чанки от прошлой версии файла
+            # Remove the old vectors so no chunks of the previous file version survive
             try:
                 vector_db.delete_by_file(file_path)
             except Exception as exc:

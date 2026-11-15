@@ -77,6 +77,7 @@ class Embedder:
         normalize: bool = True,
         max_seq_length: Optional[int] = None,
         query_prompt: Optional[str] = "query",
+        max_concurrency: int = 1,
     ):
         self.model_path = model_path
         self.device = device
@@ -84,6 +85,10 @@ class Embedder:
         self.batch_size = max(1, batch_size)
         self.normalize = normalize
         self.query_prompt = (query_prompt or "").strip() or None
+        # One GPU model serializes encode calls; a queue of 1 keeps VRAM and
+        # latency predictable. Raising it overlaps requests but uses more memory.
+        self.max_concurrency = max(1, max_concurrency)
+        self.encode_queue = asyncio.Semaphore(self.max_concurrency)
 
         log.info(
             "Loading model %s (device=%s, dtype=%s, batch=%d)",
@@ -149,8 +154,10 @@ class Embedder:
             return np.zeros((0, self.dim), dtype=np.float32)
 
         loop = asyncio.get_running_loop()
-        # Run embedding in a background thread to not block the event loop
-        vectors = await loop.run_in_executor(None, self._encode_sync, texts, prompt_name)
+        # the encode queue serializes requests on the GPU, so indexing and user
+        # queries do not compete for VRAM at the same time
+        async with self.encode_queue:
+            vectors = await loop.run_in_executor(None, self._encode_sync, texts, prompt_name)
         return np.asarray(vectors, dtype=np.float32)
 
     async def embed_query(self, texts: List[str]):

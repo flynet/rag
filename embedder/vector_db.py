@@ -38,7 +38,7 @@ class VectorDB:
         return getattr(info.config.params.vectors, "size", None)
 
     def ensure_collection(self, dim: int, distance: Distance = Distance.COSINE) -> None:
-        """Создаём коллекцию, если её нет; пересоздаём при смене размерности."""
+        """Create the collection if it is missing; recreate it when the dimension changes."""
         existing = self._collection_dim()
 
         if existing is None:
@@ -125,7 +125,7 @@ class VectorDB:
         self.client.upsert(collection_name=self.collection_name, points=points)
 
     def delete_by_file(self, file_path: str) -> None:
-        """Удаляем все точки, у которых payload.file == file_path"""
+        """Delete every point whose payload.file equals file_path."""
         flt = Filter(must=[FieldCondition(key="file", match=MatchValue(value=file_path))])
         self.client.delete(
             collection_name=self.collection_name,
@@ -203,7 +203,7 @@ class VectorDB:
         return points[0].payload or {}
 
     def is_up_to_date(self, file_path: str, signature: Dict[str, Any]) -> bool:
-        """True, если все поля signature совпадают с сохранёнными в payload."""
+        """True if every signature field matches what is stored in the payload."""
         if not signature:
             return False
         try:
@@ -218,7 +218,7 @@ class VectorDB:
         return all(payload.get(key) == value for key, value in signature.items())
 
     def file_exists(self, file_path: str) -> bool:
-        """Проверяем, есть ли уже векторы для этого файла в базе"""
+        """Whether the database already has vectors for this file."""
         try:
             return self._first_payload(file_path) is not None
         except Exception as exc:
