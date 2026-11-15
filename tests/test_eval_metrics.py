@@ -1,0 +1,254 @@
+"""Unit tests for the retrieval evaluation harness (stdlib only).
+
+Run from the repository root:
+
+    python -m unittest discover -s tests -p "test_*.py"
+
+No GPU, API, or Docker is involved: the tests work on synthetic hit lists.
+"""
+
+import base64
+import json
+import math
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import eval_retrieval as ev  # noqa: E402
+
+
+def hit(file: str, chunk: int, text: str, score: float):
+    return {"file": file, "chunk": chunk, "text": text, "score": score}
+
+
+HITS = [
+    hit("/data/documents/a.txt", 0, "Intro about Alpha", 0.90),
+    hit("/data/documents/b.txt", 1, "Unrelated Beta", 0.80),
+    hit("/data/documents/a.txt", 3, "Detail about gamma", 0.55),
+    hit("/data/documents/c.txt", 0, "Gamma note", 0.40),
+    hit("/data/documents/a.txt", 5, "Tail of Alpha", 0.20),
+]
+
+EXPECTED = [{"file": "a.txt", "text_contains": "Detail about gamma"}]
+
+
+class MatchingTests(unittest.TestCase):
+    def test_basename_matches_container_path(self):
+        self.assertTrue(ev._same_file("/data/documents/a.txt", "a.txt"))
+        self.assertFalse(ev._same_file("/data/documents/a.txt", "b.txt"))
+
+    def test_text_contains_is_case_insensitive(self):
+        self.assertTrue(ev._matches(HITS[2], {"file": "a.txt", "text_contains": "GAMMA"}))
+        self.assertFalse(ev._matches(HITS[1], {"file": "a.txt", "text_contains": "gamma"}))
+
+    def test_all_expected_fields_must_match(self):
+        self.assertFalse(ev._matches(HITS[2], {"file": "b.txt", "chunk": 3}))
+        self.assertTrue(ev._matches(HITS[2], {"file": "a.txt", "chunk": 3}))
+
+    def test_section_matches_in_gateway_mode(self):
+        # gateway hits carry no text, so `section` is the criterion that survives
+        hit = {"file": "README.md", "chunk": 4, "text": "",
+               "section": "Gateway variables > RAG", "score": 0.61}
+        self.assertTrue(ev._matches(hit, {"file": "README.md", "section": "RAG"}))
+        self.assertFalse(ev._matches(hit, {"file": "README.md", "section": "Qdrant"}))
+        # `text_contains` cannot match an empty text, which is why it is rejected
+        self.assertFalse(ev._matches(hit, {"file": "README.md", "text_contains": "RAG"}))
+
+    def test_first_relevant_rank_is_one_based(self):
+        self.assertEqual(ev._first_relevant_rank(HITS, EXPECTED), 3)
+        self.assertIsNone(ev._first_relevant_rank(HITS, [{"file": "z.txt"}]))
+
+    def test_ndcg_at_k(self):
+        # ideal = 1 relevant hit, so nDCG is 1/log2(1+3) = 1/2
+        self.assertAlmostEqual(ev._ndcg_at_k(HITS, EXPECTED, 10), 0.5, places=6)
+        self.assertEqual(ev._ndcg_at_k(HITS, [{"file": "z.txt"}], 10), 0.0)
+
+    def test_ndcg_ideal_places_all_relevant_first(self):
+        hits = [
+            hit("a.txt", 0, "x", 0.9),
+            hit("a.txt", 1, "y", 0.8),
+            hit("b.txt", 0, "z", 0.7),
+        ]
+        relevant = [{"file": "a.txt"}, {"file": "b.txt"}]
+        # the ideal ranking has 2 relevant hits: 1/log2(2) + 1/log2(3)
+        idcg = 1.0 + 1.0 / math.log2(3)
+        # actual: ranks 1, 2, 3 all relevant
+        dcg = 1.0 + 1.0 / math.log2(3) + 1.0 / math.log2(4)
+        self.assertAlmostEqual(ev._ndcg_at_k(hits, relevant, 10), dcg / idcg, places=6)
+        # a cut at 2 keeps ranks 1 and 2, ideal stays at 2
+        self.assertAlmostEqual(ev._ndcg_at_k(hits, relevant, 2), 1.0, places=6)
+
+
+class ScoreMetricsTests(unittest.TestCase):
+    def test_no_threshold_keeps_everything(self):
+        metrics = ev.score_metrics(HITS, EXPECTED, 10, ev.NO_THRESHOLD)
+        self.assertEqual(metrics["injected"], 5.0)
+        self.assertEqual(metrics["recall"], 1.0)
+        self.assertEqual(metrics["zero_context"], 0.0)
+        self.assertEqual(metrics["mrr"], 1 / 3)
+
+    def test_threshold_drops_the_relevant_hit_and_recall(self):
+        metrics = ev.score_metrics(HITS, EXPECTED, 10, 0.6)
+        self.assertEqual(metrics["injected"], 2.0)
+        self.assertEqual(metrics["recall"], 0.0)
+        self.assertEqual(metrics["mrr"], 0.0)
+
+    def test_threshold_below_the_relevant_hit_keeps_recall(self):
+        metrics = ev.score_metrics(HITS, EXPECTED, 10, 0.5)
+        self.assertEqual(metrics["injected"], 3.0)
+        self.assertEqual(metrics["recall"], 1.0)
+
+    def test_top_k_cap_limits_context_and_recall(self):
+        metrics = ev.score_metrics(HITS, EXPECTED, 2, ev.NO_THRESHOLD)
+        self.assertEqual(metrics["injected"], 2.0)
+        self.assertEqual(metrics["recall"], 0.0)
+
+    def test_threshold_can_remove_all_context(self):
+        metrics = ev.score_metrics(HITS, EXPECTED, 3, 0.95)
+        self.assertEqual(metrics["injected"], 0.0)
+        self.assertEqual(metrics["zero_context"], 1.0)
+
+
+class SweepTests(unittest.TestCase):
+    def setUp(self):
+        self.results = [
+            {
+                "id": "q1",
+                "expected": EXPECTED,
+                "hits": HITS,
+                "returned": len(HITS),
+                "first_rank": 3,
+            },
+            {
+                "id": "q2",
+                "expected": [{"file": "b.txt"}],
+                "hits": HITS,
+                "returned": len(HITS),
+                "first_rank": 2,
+            },
+        ]
+
+    def test_grid_shape(self):
+        grid = ev.sweep(self.results, [3, 5], [0.5, 0.9])
+        self.assertEqual(grid["top_ks"], [3, 5])
+        self.assertEqual(len(grid["rows"]), 2)
+
+    def test_recall_and_context_are_averaged_over_questions(self):
+        grid = ev.sweep(self.results, [3], [0.5])
+        row = grid["rows"][0]
+        # q1: relevant at rank 3 with score 0.55 -> injected; q2: relevant at rank 2
+        self.assertAlmostEqual(row["recall@3"], 1.0)
+        self.assertAlmostEqual(row["injected@3"], 3.0)
+        self.assertAlmostEqual(row["zero_context@3"], 0.0)
+        self.assertAlmostEqual(row["mrr@3"], (1 / 3 + 1 / 2) / 2)
+
+    def test_high_threshold_leaves_questions_without_context(self):
+        grid = ev.sweep(self.results, [5], [0.95])
+        row = grid["rows"][0]
+        # nothing survives the threshold, so every question loses its context
+        self.assertAlmostEqual(row["zero_context@5"], 1.0)
+        self.assertAlmostEqual(row["injected@5"], 0.0)
+        self.assertAlmostEqual(row["recall@5"], 0.0)
+
+    def test_threshold_can_keep_one_question_relevant(self):
+        grid = ev.sweep(self.results, [5], [0.8])
+        row = grid["rows"][0]
+        # q2's b.txt hit (0.80) survives and is relevant; q1's relevant hit (0.55) is cut
+        self.assertAlmostEqual(row["recall@5"], 0.5)
+        self.assertAlmostEqual(row["injected@5"], 2.0)
+        self.assertAlmostEqual(row["mrr@5"], (0.0 + 1 / 2) / 2)
+        self.assertAlmostEqual(row["zero_context@5"], 0.0)
+
+
+class SourceHeaderTests(unittest.TestCase):
+    def test_decode_unpadded_base64url(self):
+        payload = [{"file": "/data/documents/a.txt", "chunk": 2, "score": 0.61}]
+        raw = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+        self.assertEqual(ev.decode_sources(raw), payload)
+
+    def test_missing_header_is_empty(self):
+        self.assertEqual(ev.decode_sources(None), [])
+        self.assertEqual(ev.decode_sources(""), [])
+
+
+class DatasetTests(unittest.TestCase):
+    def _write(self, lines):
+        tmp = Path(tempfile.mkdtemp()) / "questions.jsonl"
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return tmp
+
+    def test_ids_are_numbered_when_absent(self):
+        path = self._write([
+            json.dumps({"question": "alpha", "relevant": [{"file": "a.txt"}]}),
+            json.dumps({"question": "beta", "relevant": [{"file": "b.txt", "chunk": 1}]}),
+        ])
+        questions = ev.load_questions(path)
+        self.assertEqual([q["id"] for q in questions], ["q001", "q002"])
+        self.assertEqual(questions[1]["relevant"][0]["chunk"], 1)
+
+    def test_history_is_read_as_user_turns(self):
+        path = self._write([
+            json.dumps({"question": "and the second one?", "history": ["first topic", "second topic"],
+                        "relevant": [{"file": "a.txt"}]}),
+        ])
+        self.assertEqual(ev.load_questions(path)[0]["history"], ["first topic", "second topic"])
+
+    def test_text_contains_is_rejected_in_gateway_mode(self):
+        path = self._write([
+            json.dumps({"question": "alpha", "relevant": [{"file": "a.txt", "text_contains": "x"}]}),
+        ])
+        with self.assertRaises(SystemExit):
+            ev.load_questions(path, gateway=True)
+
+    def test_unknown_field_is_rejected(self):
+        path = self._write([
+            json.dumps({"question": "alpha", "relevant": [{"page": 3}]}),
+        ])
+        with self.assertRaises(SystemExit):
+            ev.load_questions(path)
+
+    def test_bad_history_is_rejected(self):
+        path = self._write([
+            json.dumps({"question": "alpha", "relevant": [{"file": "a.txt"}], "history": "not a list"}),
+        ])
+        with self.assertRaises(SystemExit):
+            ev.load_questions(path)
+
+
+class CorpusCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.corpus = Path(tempfile.mkdtemp())
+        (self.corpus / "README.md").write_text("# Guide\n\nAlpha details\n", encoding="utf-8")
+
+    def test_ground_truth_matches(self):
+        questions = [{"id": "q1", "relevant": [{"file": "README.md", "text_contains": "alpha"}]}]
+        self.assertEqual(ev.check_corpus(questions, self.corpus), [])
+
+    def test_section_is_validated_against_the_corpus(self):
+        questions = [{"id": "q1", "relevant": [{"file": "README.md", "section": "# Guide"}]}]
+        self.assertEqual(ev.check_corpus(questions, self.corpus), [])
+        questions = [{"id": "q2", "relevant": [{"file": "README.md", "section": "## Missing"}]}]
+        problems = ev.check_corpus(questions, self.corpus)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("section", problems[0])
+
+    def test_missing_text_is_reported(self):
+        questions = [{"id": "q1", "relevant": [{"file": "README.md", "text_contains": "gamma"}]}]
+        problems = ev.check_corpus(questions, self.corpus)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not in", problems[0])
+
+    def test_missing_file_is_reported(self):
+        questions = [{"id": "q1", "relevant": [{"file": "gone.md", "text_contains": "alpha"}]}]
+        problems = ev.check_corpus(questions, self.corpus)
+        self.assertTrue(any("not found" in problem for problem in problems))
+
+
+if __name__ == "__main__":
+    unittest.main()
