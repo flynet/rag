@@ -207,9 +207,9 @@ model, chunking, or query-prompt change; the numbers are not transferable.
 - [x] Extend the evaluation set with multi-turn follow-ups.
 
 **Acceptance criteria:**
-- Follow-up questions retrieve the correct passages in the evaluation set.
-- Single-turn questions do not regress.
-- Added latency is bounded and documented.
+- Follow-up questions retrieve the correct passages in the evaluation set. *(met: `concat` puts the expected section in the top ten for all 9 follow-ups, `recall@10` `1.000`; `off` leaves 2 outside)*
+- Single-turn questions do not regress. *(met: 60 single-turn questions through the gateway give identical `recall@10 0.800` / `MRR@10 0.414` with `off` and `concat`, the same twelve top-10 failures as `eval/baseline.json`; the guarantee is also asserted offline in `tests/test_gateway_rewrite.py`)*
+- Added latency is bounded and documented. *(met: `concat` adds no upstream call; `llm` adds exactly one, bounded by `RAG_REWRITE_TIMEOUT` (10 s) and cached by `RAG_REWRITE_CACHE_SIZE`; the measured run-to-run latency difference is upstream-dominated, documented in README and `eval/README.md`)*
 
 **Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`): requests without history and long non-elliptical questions are never rewritten, `llm` is time-boxed by `RAG_REWRITE_TIMEOUT` (10 s), falls back to `concat` on failure, and rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The default is `concat` in the gateway code, `docker-compose.yaml` and `.env.example`, measured on `eval/questions.multiturn.jsonl` (9 follow-up conversations, gateway mode, 20 candidates requested, threshold disabled, frozen corpus, one session):
 
