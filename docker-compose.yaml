@@ -1,12 +1,24 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:${QDRANT_VERSION:-v1.20.1}
     container_name: qdrant
     restart: unless-stopped
     ports:
       - "6333:6333"
     volumes:
       - ./qdrant_data:/qdrant/storage
+    healthcheck:
+      # The official image is debian-slim and has no curl/wget. Bash's
+      # /dev/tcp is enough to confirm that the HTTP port accepts connections.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/6333"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # Watchdog + Qdrant writer. No torch, no CUDA, no model:
   # vectors are requested over HTTP from `api`.
@@ -17,8 +29,10 @@ services:
     volumes:
       - ./data:/data:rw
     depends_on:
-      - qdrant
-      - api
+      qdrant:
+        condition: service_healthy
+      api:
+        condition: service_healthy
     environment:
       - API_URL=http://api:8000
       - WATCH_PATH=/data/documents
@@ -46,17 +60,18 @@ services:
     volumes:
       - ./models:/models:rw          # also the HF cache (HF_HOME below)
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_healthy
     environment:
       - MODEL_PATH=${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
       - HF_HOME=/models/hf-cache
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cuda}
       - EMBEDDING_DTYPE=${EMBEDDING_DTYPE:-float16}
       - EMBEDDING_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
-      # Имя retrieval-промпта модели для запросов (Qwen3-Embedding: "query").
-      # Пусто - кодировать запросы без инструкции, как документы.
+      # Retrieval prompt name for queries (Qwen3-Embedding: "query").
+      # Empty = encode queries without an instruction, like documents.
       - EMBEDDING_QUERY_PROMPT=${EMBEDDING_QUERY_PROMPT:-query}
-      # Ограничение длины входа в токенах (32k у модели; чанки и запросы короче)
+      # Input length limit in tokens (the model supports 32k; chunks and queries are shorter).
       - EMBEDDING_MAX_SEQ_LENGTH=${EMBEDDING_MAX_SEQ_LENGTH:-8192}
       - EMBEDDING_MODEL_NAME=rag-embeddings
       - QDRANT_HOST=qdrant
@@ -64,6 +79,19 @@ services:
       - COLLECTION_NAME=documents
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      # /health returns 200 even while the model is loading, so require the
+      # embedder to report "ready" explicitly. The first start may download
+      # ~1.2 GB of weights; start_period covers that.
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import json,sys,urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)); sys.exit(0 if data.get('embedder') == 'ready' else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10m
 
   # The only service agents need to talk to: OpenAI-compatible API with RAG.
   # Base URL: http://localhost:8001/v1
@@ -79,7 +107,10 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      - api
+      api:
+        # The gateway can start (and degrade) while the model is loading;
+        # chat requests still work without retrieval during that window.
+        condition: service_started
     environment:
       - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}

@@ -10,7 +10,7 @@ import logging
 import os
 import signal
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
@@ -34,6 +34,11 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1024"))   # символы
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "128"))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 
+# Qdrant readiness: Compose waits for the healthcheck, but the indexer can also
+# run outside Compose. 60 × 2s = 2 minutes.
+QDRANT_READY_ATTEMPTS = int(os.environ.get("QDRANT_READY_ATTEMPTS", "60"))
+QDRANT_READY_DELAY = float(os.environ.get("QDRANT_READY_DELAY", "2.0"))
+
 # Метка модели попадает в payload: при её смене индекс пересобирается
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "unknown")
 
@@ -50,6 +55,36 @@ def file_signature(path: Path) -> Dict[str, Any]:
         "chunking_version": CHUNKER_VERSION,
         "model": EMBEDDING_MODEL,
     }
+
+
+async def wait_for_qdrant(
+    vector_db: VectorDB,
+    attempts: int = QDRANT_READY_ATTEMPTS,
+    delay: float = QDRANT_READY_DELAY,
+) -> None:
+    """Wait until Qdrant answers, so startup does not depend on Compose order."""
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            vector_db.client.get_collections()
+            if attempt > 1:
+                log.info("Qdrant is ready (attempt %d/%d)", attempt, attempts)
+            return
+        except Exception as exc:  # noqa: BLE001 - retry connection problems
+            last_error = exc
+            if attempt == attempts:
+                break
+            if attempt in (1, 5) or attempt % 15 == 0:
+                log.info(
+                    "Waiting for Qdrant (attempt %d/%d): %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(f"Qdrant did not become ready in time: {last_error}")
 
 
 # --- Watcher with debounce ---
@@ -188,6 +223,12 @@ async def main():
 
     # connect to vector DB
     vector_db = VectorDB()
+
+    # Wait for Qdrant, then for the embedding service. Compose already gates
+    # both with healthchecks; this keeps a bare `python main.py` working too.
+    log.info("Waiting for Qdrant...")
+    await wait_for_qdrant(vector_db)
+    log.info("Qdrant is ready")
 
     # Wait for the embedding service and create/migrate the collection
     log.info("Waiting for embedding service at %s", API_URL)

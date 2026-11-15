@@ -163,22 +163,24 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Notes:** this is a breaking collection change; plan a re-index window. Keep the dense branch as a fallback if sparse vectors are missing.
 
-### [ ] P2.2 Reliability: healthchecks, pinned versions, retries
+### [~] P2.2 Reliability: healthchecks, pinned versions, retries
 
-**Why:** Compose starts services before they are ready; `api` may still be downloading weights, and Qdrant is pulled as `latest`.
+**Why:** Compose starts services before they are ready; `api` may still be downloading weights, and Qdrant was pulled as `latest`.
 
 **Scope:**
-- [ ] Pin `qdrant/qdrant` to a specific version (the one currently running in production).
-- [ ] Add an `api` healthcheck that requires `embedder == "ready"` (plain `/health` returns 200 even while loading).
-- [ ] Add a Qdrant healthcheck. Note: the official image is `debian:13-slim` without `curl`/`wget`; use a TCP check (`bash /dev/tcp`) or a sidecar/custom image.
-- [ ] Add `depends_on` conditions where they make sense: `embedder` waits for `api`; `gateway` may start early and degrade gracefully.
-- [ ] Add retry/backoff around Qdrant connection setup.
-- [ ] Document the startup sequence and expected first-boot duration (~1.2 GB download + model load).
+- [x] Pin `qdrant/qdrant` to a specific version (`v1.20.1`, overridable via `QDRANT_VERSION`).
+- [x] Add an `api` healthcheck that requires `embedder == "ready"` (plain `/health` returns 200 even while loading).
+- [x] Add a Qdrant healthcheck. The official image has no `curl`/`wget`, so it uses a TCP check (`bash /dev/tcp`).
+- [x] Add `depends_on` conditions: `api` and `embedder` wait for Qdrant; `embedder` waits for `api`; `gateway` starts early and degrades gracefully.
+- [x] Add retry/backoff around Qdrant connection setup in the indexer.
+- [x] Document the startup sequence and expected first-boot duration (~1.2 GB download + model load).
 
 **Acceptance criteria:**
 - Fresh `docker compose up` reaches a working state without a crash loop.
 - `docker compose ps` shows meaningful health states.
 - Upgrading Qdrant is a deliberate, tested action.
+
+**Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. E2E (`docker compose up` with the GPU stack) is still pending because Docker Desktop is not running here.
 
 ### [ ] P2.3 Qdrant snapshots and restore
 

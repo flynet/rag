@@ -27,8 +27,8 @@ This is the state of the code in this repository, not a target design.
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
 | Indexing | Startup reconciliation + scan, `watchdog`, signature-based incremental updates |
 | Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
-| Qdrant | `qdrant/qdrant:latest`, no snapshot schedule |
-| Healthchecks | Gateway only; `api` and Qdrant have none |
+| Qdrant | `qdrant/qdrant:v1.20.1` pinned via `QDRANT_VERSION`; no snapshot schedule |
+| Healthchecks | Gateway, `api`, and Qdrant; `embedder` waits for Qdrant and `api` |
 | Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
 | Target hardware | One GPU, tested on RTX 4060 Laptop with 8 GB VRAM |
 
@@ -165,6 +165,12 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 
 - **Port:** `6333`
 - **Dashboard:** http://localhost:6333/dashboard
+- **Version:** pinned to `v1.20.1` via `QDRANT_VERSION` in `.env`. Bump it deliberately: take a snapshot and verify the storage format before changing the tag.
+- **Healthcheck:** TCP connect to `127.0.0.1:6333` (the official image has no `curl`/`wget`); `api` and `embedder` wait for it with `depends_on: condition: service_healthy`.
+
+### Startup order
+
+Compose starts Qdrant, then `api` (which loads the embedding model), then `embedder`. `api` is considered healthy only when `/health` reports `embedder: "ready"`, so the first start may take several minutes while the model downloads. The gateway starts early and serves chat without retrieval until `api` is ready; `/health` shows `degraded` during that window.
 
 ### LLM server — external upstream
 
@@ -419,6 +425,7 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEYS` | — | comma-separated bearer keys; empty disables auth |
+| `QDRANT_VERSION` | `v1.20.1` | pinned Qdrant image tag; bump after a snapshot |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | embedding model (one per deployment) |
 | `EMBEDDING_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `EMBEDDING_DTYPE` | `float16` | `float16`, `bfloat16`, `float32`, `auto`; CPU always uses fp32 |
@@ -597,7 +604,6 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 - **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
 - **No reranker** — the top-`k` dense results go straight into the prompt.
 - **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
-- **No API/Qdrant healthchecks** — `depends_on` does not wait for readiness; Qdrant is pulled as `latest`.
 - **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
 - **Multi-turn follow-ups** — only the last user message is embedded, so elliptical questions ("what about the second one?") retrieve poorly.
 - **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
