@@ -1,0 +1,60 @@
+{"id": "q-001", "question": "What is the default value of RAG_TOP_K?", "relevant": [{"file": "env_example.txt", "text_contains": "RAG_TOP_K=3"}]}
+{"id": "q-002", "question": "What is the default value of RAG_MIN_SCORE?", "relevant": [{"file": "env_example.txt", "text_contains": "RAG_MIN_SCORE=0.5"}]}
+{"id": "q-003", "question": "Which GPU is the stack tested on?", "relevant": [{"file": "README.md", "text_contains": "tested on RTX 4060 Laptop"}]}
+{"id": "q-004", "question": "Which embedding model does the stack use?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B"}]}
+{"id": "q-005", "question": "How many dimensions do the embedding vectors have?", "relevant": [{"file": "README.md", "text_contains": "1024 dimensions"}]}
+{"id": "q-006", "question": "What is the vector dimension of the previous embeddinggemma-300m model?", "relevant": [{"file": "env_example.txt", "text_contains": "embeddinggemma-300m: 768"}]}
+{"id": "q-007", "question": "Which Qdrant version is pinned in the configuration?", "relevant": [{"file": "env_example.txt", "text_contains": "QDRANT_VERSION=v1.20.1"}]}
+{"id": "q-008", "question": "What chunk size and overlap does the chunker use?", "relevant": [{"file": "README.md", "text_contains": "1024-character limit, 128-character overlap"}]}
+{"id": "q-009", "question": "Which port does the OpenAI-compatible gateway listen on?", "relevant": [{"file": "README.md", "text_contains": "OPENAI_BASE_URL=http://localhost:8001/v1"}]}
+{"id": "q-010", "question": "What is the default embedding dtype?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBEDDING_DTYPE=float16"}]}
+{"id": "q-011", "question": "How many texts are sent in one embedding request?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBED_BATCH_SIZE=32"}]}
+{"id": "q-012", "question": "Which variable caps the number of tokens per embedded text?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBEDDING_MAX_SEQ_LENGTH=8192"}]}
+{"id": "q-013", "question": "How do I disable gateway authentication?", "relevant": [{"file": "env_example.txt", "text_contains": "Leave empty to disable authentication"}]}
+{"id": "q-014", "question": "What is the default LLM generation timeout?", "relevant": [{"file": "env_example.txt", "text_contains": "UPSTREAM_TIMEOUT=600"}]}
+{"id": "q-015", "question": "Is the trailing /v1 required in UPSTREAM_BASE_URL?", "relevant": [{"file": "env_example.txt", "text_contains": "With or without the trailing /v1 - both work:"}]}
+{"id": "q-016", "question": "Which request header turns RAG off for a single chat call?", "relevant": [{"file": "README.md", "text_contains": "Per-request RAG control"}]}
+{"id": "q-017", "question": "Which response headers expose the retrieved passages?", "relevant": [{"file": "README.md", "text_contains": "Sources in the response"}]}
+{"id": "q-018", "question": "How does the evaluation harness define recall@k?", "relevant": [{"file": "eval_README.md", "text_contains": "fraction of questions with at least one relevant hit in the top"}]}
+{"id": "q-019", "question": "Which endpoint does the evaluation harness call?", "relevant": [{"file": "eval_README.md", "text_contains": "embedding API"}]}
+{"id": "q-020", "question": "Which ground-truth criterion stays stable when the chunker changes?", "relevant": [{"file": "eval_README.md", "text_contains": "is usually the most stable criterion"}]}
+{"id": "q-021", "question": "Where do I put files so that they get indexed automatically?", "relevant": [{"file": "README.md", "text_contains": "Watches `./data/documents`"}]}
+{"id": "q-022", "question": "What happens to the index when I switch to a different embedding model?", "relevant": [{"file": "env_example.txt", "text_contains": "Changing it invalidates the index"}]}
+{"id": "q-023", "question": "How do I run embeddings on the CPU instead of the GPU?", "relevant": [{"file": "README.md", "text_contains": "EMBEDDING_DEVICE=cpu"}]}
+{"id": "q-024", "question": "Which setting reduces VRAM fragmentation?", "relevant": [{"file": "README.md", "text_contains": "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"}]}
+{"id": "q-025", "question": "How do I restore a Qdrant snapshot from a backup file?", "relevant": [{"file": "README.md", "text_contains": "Restore replaces the collection data"}]}
+{"id": "q-026", "question": "Which Compose command destroys the Qdrant storage volume?", "relevant": [{"file": "README.md", "text_contains": "removes the containers"}]}
+{"id": "q-027", "question": "Is there a chat UI in the gateway?", "relevant": [{"file": "README.md", "text_contains": "There is no chat UI"}]}
+{"id": "q-028", "question": "Does the gateway forward the upstream key to agents?", "relevant": [{"file": "README.md", "text_contains": "the upstream key never leaves it"}]}
+{"id": "q-029", "question": "Does this stack include the generation model?", "relevant": [{"file": "README.md", "text_contains": "The generation model is"}]}
+{"id": "q-030", "question": "Which service starts first in Compose?", "relevant": [{"file": "README.md", "text_contains": "Compose starts Qdrant, then"}]}
+{"id": "q-031", "question": "Why does the Qdrant healthcheck use a TCP connection?", "relevant": [{"file": "README.md", "text_contains": "the official image has no"}]}
+{"id": "q-032", "question": "What memory limits are configured for the services?", "relevant": [{"file": "README.md", "text_contains": "mem_limit"}]}
+{"id": "q-033", "question": "Which library watches the documents folder?", "relevant": [{"file": "README.md", "text_contains": "watchdog"}]}
+{"id": "q-034", "question": "What does the gateway do when context is injected?", "relevant": [{"file": "README.md", "text_contains": "Context is injected only for a \"fresh\" user turn"}]}
+{"id": "q-035", "question": "Какая модель используется для эмбеддингов?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B"}]}
+{"id": "q-036", "question": "Сколько измерений у векторов эмбеддинга?", "relevant": [{"file": "env_example.txt", "text_contains": "Qwen3-Embedding-0.6B: 1024"}]}
+{"id": "q-037", "question": "Какая версия Qdrant зафиксирована?", "relevant": [{"file": "env_example.txt", "text_contains": "QDRANT_VERSION=v1.20.1"}]}
+{"id": "q-038", "question": "Как восстановить индекс из снапшота?", "relevant": [{"file": "README.md", "text_contains": "Restore replaces the collection data"}]}
+{"id": "q-039", "question": "Что делать при CUDA out of memory?", "relevant": [{"file": "README.md", "text_contains": "the embedding model does not fit in VRAM"}]}
+{"id": "q-040", "question": "Можно ли обходиться без GPU?", "relevant": [{"file": "README.md", "text_contains": "Qwen3-Embedding-0.6B is noticeably slower on CPU"}]}
+{"id": "q-041", "question": "Как часто embedder проверяет папку документов?", "relevant": [{"file": "README.md", "text_contains": "polling every second"}]}
+{"id": "q-042", "question": "Можно ли использовать LM Studio как генерирующую модель?", "relevant": [{"file": "README.md", "text_contains": "vLLM, LM Studio, llama.cpp"}]}
+{"id": "q-043", "question": "Who is Alice Davince?", "relevant": [{"file": "example.txt", "text_contains": "Alice Davince"}]}
+{"id": "q-044", "question": "What makes a file get re-indexed?", "relevant": [{"file": "README.md", "text_contains": "unchanged files are not re-indexed"}]}
+{"id": "q-045", "question": "Which payload fields describe the chunk position in the document?", "relevant": [{"file": "README.md", "text_contains": "stores the original chunk text"}]}
+{"id": "q-046", "question": "What is the product direction of the project?", "relevant": [{"file": "TODO.md", "text_contains": "Product direction — Local Knowledge Engine"}]}
+{"id": "q-047", "question": "Which roadmap item covers hybrid BM25 and dense search?", "relevant": [{"file": "TODO.md", "text_contains": "P2.1 Hybrid search"}]}
+{"id": "q-048", "question": "Which roadmap item is about Tree-sitter chunking by symbol units?", "relevant": [{"file": "TODO.md", "text_contains": "P6.1 Tree-sitter chunking by symbol units"}]}
+{"id": "q-049", "question": "Which roadmap item adds an MCP server with retrieval tools?", "relevant": [{"file": "TODO.md", "text_contains": "P8.1 MCP server with retrieval tools"}]}
+{"id": "q-050", "question": "What are the declared non-goals of the initial scope?", "relevant": [{"file": "TODO.md", "text_contains": "Non-goals (initial scope)"}]}
+{"id": "q-051", "question": "Can a reranker fit alongside the embedding model?", "relevant": [{"file": "TODO.md", "text_contains": "VRAM fits alongside the embedding model on 8 GB"}]}
+{"id": "q-052", "question": "What is the current reranking support in the stack?", "relevant": [{"file": "README.md", "text_contains": "Reranking | None"}]}
+{"id": "q-053", "question": "Is hybrid or sparse search implemented?", "relevant": [{"file": "README.md", "text_contains": "Hybrid / sparse search | None"}]}
+{"id": "q-054", "question": "Which Python packages are pinned for the embedding model?", "relevant": [{"file": "README.md", "text_contains": "transformers>=4.51"}]}
+{"id": "q-055", "question": "What does the gateway health endpoint report about the upstream?", "relevant": [{"file": "README.md", "text_contains": "\"upstream\": {\"url\":"}]}
+{"id": "q-056", "question": "Which follow-up rewrite modes does the gateway support?", "relevant": [{"file": "env_example.txt", "text_contains": "off    - embed only the last user message (default)"}]}
+{"id": "q-057", "question": "What is the query prompt used for Qwen3-Embedding?", "relevant": [{"file": "env_example.txt", "text_contains": "EMBEDDING_QUERY_PROMPT=query"}]}
+{"id": "q-058", "question": "Что происходит с чанками файла, когда его удаляют из папки документов?", "relevant": [{"file": "README.md", "text_contains": "deletes the file's old vectors"}]}
+{"id": "q-059", "question": "How many previous user turns are considered for a rewrite?", "relevant": [{"file": "env_example.txt", "text_contains": "RAG_REWRITE_HISTORY=3"}]}
+{"id": "q-060", "question": "Which service owns the single embedding model instance?", "relevant": [{"file": "env_example.txt", "text_contains": "A single model instance is loaded (inside `api`)"}]}

@@ -1,0 +1,72 @@
+# Local secrets - copy to .env and adjust.
+#
+# Comma-separated list of bearer tokens accepted by the gateway.
+# Leave empty to disable authentication (local development only!).
+API_KEYS=
+
+# --- Vector database ----------------------------------------------------------
+# Pinned Qdrant image tag. Bump deliberately and take a snapshot first:
+# upgrading a storage format in place is not guaranteed to be reversible.
+QDRANT_VERSION=v1.20.1
+
+# --- Embeddings ---------------------------------------------------------------
+# A single model instance is loaded (inside `api`) and shared with `embedder`.
+# Changing it invalidates the index: all documents are re-indexed, and the Qdrant
+# collection is recreated automatically when the vector dimension changes
+# (Qwen3-Embedding-0.6B: 1024, embeddinggemma-300m: 768).
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+
+# cuda | cpu
+EMBEDDING_DEVICE=cuda
+# float16 | bfloat16 | float32 | auto  (CPU always uses float32)
+EMBEDDING_DTYPE=float16
+# Texts per embedding request
+EMBED_BATCH_SIZE=32
+
+# Qwen3-Embedding is instruction-aware: queries are encoded with the model's
+# "query" prompt ("Instruct: Given a web search query, retrieve relevant
+# passages that answer the query"), documents without it. Empty = no prompt.
+EMBEDDING_QUERY_PROMPT=query
+# Max tokens per text. The model supports 32k, but 8192 is plenty for the
+# 1024-character chunks used by the indexer and keeps VRAM predictable.
+EMBEDDING_MAX_SEQ_LENGTH=8192
+
+# --- RAG ----------------------------------------------------------------------
+ENABLE_RAG=true
+RAG_TOP_K=3
+RAG_MIN_SCORE=0.5
+
+# Follow-up query rewriting before retrieval:
+#   off    - embed only the last user message (default)
+#   concat - prepend recent user turns for short/elliptical questions
+#   llm    - ask the upstream model for a standalone query (extra call, falls
+#            back to concat when it fails or times out)
+RAG_QUERY_REWRITE=off
+# Number of previous user turns to consider
+RAG_REWRITE_HISTORY=3
+# Timeout in seconds for the llm rewrite call
+RAG_REWRITE_TIMEOUT=10
+
+# --- LLM upstream (self-hosted OpenAI-compatible server) ----------------------
+# Any server speaking the OpenAI API: vLLM, LM Studio, llama.cpp server, TGI,
+# or a cloud endpoint. Usually another machine on the LAN.
+#
+# With or without the trailing /v1 - both work:
+#   http://192.168.1.50:8000
+#   http://192.168.1.50:8000/v1
+UPSTREAM_BASE_URL=
+
+# Sent to the model server as "Authorization: Bearer <key>".
+# Leave empty for servers without auth (LM Studio, llama.cpp by default).
+# Agents never see this value.
+UPSTREAM_API_KEY=
+
+# Optional extra headers as a JSON object, e.g.
+#   UPSTREAM_HEADERS={"X-Title":"rag-gateway"}
+UPSTREAM_HEADERS=
+
+# LLM generation timeout in seconds (streaming included)
+UPSTREAM_TIMEOUT=600
+
+# DEBUG | INFO | WARNING
+LOG_LEVEL=INFO

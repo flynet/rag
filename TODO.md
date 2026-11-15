@@ -84,17 +84,17 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 
 ## P0 — Correctness and measurement
 
-### [~] P0.1 Retrieval evaluation harness
+### [x] P0.1 Retrieval evaluation harness
 
 **Why:** there is currently no way to tell whether a change (model, chunking, reranker, prompt) improves retrieval.
 
 **Scope:**
-- [ ] Create `eval/questions.jsonl` with 50–200 real questions.
-- [ ] Ground truth per question: `file` plus either `chunk` index or a text substring unique to the relevant chunk.
+- [x] Create `eval/questions.jsonl` with 50–200 real questions.
+- [x] Ground truth per question: `file` plus either `chunk` index or a text substring unique to the relevant chunk.
 - [x] Add `scripts/eval_retrieval.py` (stdlib) that calls `POST /search` with `min_score: null` and `top_k` 10 and 50.
 - [x] Metrics: `recall@5`, `recall@10`, `MRR@10`, `nDCG@10`.
 - [x] Print per-question failures (missed / wrong rank) and a summary table.
-- [ ] Save the baseline for `Qwen3-Embedding-0.6B` to `eval/baseline.json`.
+- [x] Save the baseline for `Qwen3-Embedding-0.6B` to `eval/baseline.json`.
 - [x] Document the dataset format and usage in `eval/README.md`.
 
 **Acceptance criteria:**
@@ -102,7 +102,7 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - Baseline numbers for the current model are committed.
 - Questions cover: exact terms/identifiers, paraphrases, Russian/English, and multi-chunk answers.
 
-**Notes:** the harness, schema, example dataset, and `--min-recall`/`--min-mrr` gates are in place. Remaining work: add real questions and commit the baseline. Keep the dataset small but representative; 50 well-chosen questions are better than 500 synthetic ones. Do not tune on the same questions you report as final — keep a held-out subset.
+**Notes:** 60 questions in `eval/questions.jsonl` over the corpus committed in `eval/corpus/` (202 chunks: `README.md` 68, `TODO.md` 80, `env_example.txt` 40, `eval_README.md` 13, `example.txt` 1). Coverage: exact identifiers and env keys/defaults, versions, ports, hardware, chunking, snapshot and restore commands, health endpoints, roadmap item names, paraphrases, Russian and English, multi-chunk answers. Ground truth was verified twice: offline against `eval/corpus` (`--corpus`) and against the indexed chunks, so every `text_contains` needle exists in the collection. Baseline committed in `eval/baseline.json`: `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557`; recorded gates `--min-recall 0.70 --min-mrr 0.35`, verified by a gate run against the live stack. 12 of 60 questions have no expected hit in the top 10, and they concentrate on short table rows (`Current state`, config tables, troubleshooting) — direct evidence for P2.1 hybrid search and P0.3 tuning. Caveats: the corpus is self-referential (project docs and the env template), so real user documents and a held-out subset are still to be added.
 
 ### [~] P0.2 Startup reconciliation of stale vectors
 
@@ -120,16 +120,17 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - Rename a file while stopped: only the new path is searchable.
 - Unchanged files are not re-embedded.
 
-**Notes:** implemented in `VectorDB.reconcile_files()` and called before the startup scan. Needs end-to-end verification with Docker (daemon was not running during implementation). Keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
+**Notes:** implemented in `VectorDB.reconcile_files()` and called before the startup scan. Live evidence from the running stack: deleting a file logged `File disappeared (deleted?)` and `Deleted vectors for /data/documents/Text Document.txt`; a queued index job raced the delete and left one orphaned chunk, which was removed with a filtered `points/delete` (`points_count` 193 → 192). The delete-while-stopped acceptance run is still to be done, together with the rename case. Keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
 
 ### [ ] P0.3 Tune `RAG_TOP_K` / `RAG_MIN_SCORE`
 
 **Why:** `3` and `0.5` are inherited defaults, not measured values. Qwen3-Embedding has a different score distribution than embeddinggemma.
 
 **Scope:**
-- [ ] Run the evaluation harness for `top_k` ∈ {3, 5, 8, 10}.
-- [ ] Run it for `min_score` ∈ {0.3, 0.4, 0.5, 0.6} (and with the threshold disabled).
+- [x] Run the evaluation harness for `top_k` ∈ {3, 5, 8, 10}.
+- [x] Run it for `min_score` ∈ {0.3, 0.4, 0.5, 0.6} (and with the threshold disabled).
 - [ ] Check query-prompt on/off (`EMBEDDING_QUERY_PROMPT=query` vs empty) on the same set.
+- [ ] Sweep the follow-up set (`eval/questions.multiturn.jsonl`) in gateway mode with the same grid.
 - [ ] Record the chosen values in `.env.example` and README.
 
 **Acceptance criteria:**
@@ -169,14 +170,14 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - [x] Store `title`, `section`, `char_start`, `char_end` in the payload.
 - [x] Keep deterministic chunk IDs; include the chunking version in the file signature.
 - [x] Update docs and expose the metadata through `/search`, `/collection/sample`, and `X-RAG-Sources`.
-- [ ] Re-index the corpus and re-run the evaluation.
+- [x] Re-index the corpus and re-run the evaluation.
 
 **Acceptance criteria:**
 - Chunks no longer start/end mid-word in the common case.
 - Citations can point to a section and character range.
 - Evaluation improves or stays flat; indexing time is acceptable.
 
-**Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. The live pipeline is verified through Docker: `embedder` indexed `example.txt` (`Upserted 1 chunks for /data/documents/example.txt`), `api` `/collection/info` reports `points=1 dim=1024`, `/collection/sample` and `X-RAG-Sources` carry `title`, `section`, `char_start`, `char_end`, and the chat answer cited `/data/documents/example.txt` from the injected passage. Remaining work: run the evaluation on a real corpus and compare against the baseline. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words).
+**Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. The live pipeline is verified through Docker: `embedder` indexed `example.txt` (`Upserted 1 chunks for /data/documents/example.txt`), `api` `/collection/info` reports `points=1 dim=1024`, `/collection/sample` and `X-RAG-Sources` carry `title`, `section`, `char_start`, `char_end`, and the chat answer cited `/data/documents/example.txt` from the injected passage. The corpus was re-indexed with `CHUNKER_VERSION = 2` (192 chunks over 5 files) and the evaluation now runs against it: P0.1 numbers are the baseline floor, recorded before any later change. There are no pre-chunker numbers to compare against, so the acceptance criterion "improves or stays flat" is measured from this point forward. Indexing 5 documents (about 86 KB of text) took under a minute. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words).
 
 ### [~] P1.3 Multi-turn query rewriting
 
@@ -188,14 +189,14 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - [x] Option B (better): rewrite the query with the upstream LLM using the last N turns; cache and time-box it.
 - [x] Add an env flag (`RAG_QUERY_REWRITE=off|concat|llm`).
 - [x] Keep the current behavior inside tool loops (last message is `tool`/`assistant`).
-- [ ] Extend the evaluation set with multi-turn follow-ups.
+- [x] Extend the evaluation set with multi-turn follow-ups.
 
 **Acceptance criteria:**
 - Follow-up questions retrieve the correct passages in the evaluation set.
 - Single-turn questions do not regress.
 - Added latency is bounded and documented.
 
-**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The evaluation harness currently sends a single `question` to `/search`, so it cannot measure gateway-level rewriting yet; that is the remaining work together with the dataset.
+**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The harness can now measure gateway-level rewriting: `--mode gateway` sends the `history` turns plus the follow-up to `/v1/chat/completions` with `X-RAG-TOP-K=20` and the threshold disabled, and reads the sources back from `X-RAG-Sources` (header names are normalized to lowercase, because uvicorn lowercases them). `eval/questions.multiturn.jsonl` is the follow-up set: 9 conversations, ground truth by `file` + `section`. Measured with `RAG_QUERY_REWRITE=off` (the current default): recall@5=0.667, recall@10=0.778, MRR@10=0.277, nDCG@10=0.392; the sweep on the same pass shows `RAG_MIN_SCORE=0.5` leaving 78% of follow-ups with no context at all, `0.3` leaving 11%. Remaining work: compare `off` / `concat` / `llm` on this set with the tuned threshold, and record the added upstream latency.
 
 ---
 
@@ -279,19 +280,31 @@ therefore a named volume, and `./qdrant_snapshots` is bind-mounted so node snaps
 - A snapshot can be restored into a fresh Qdrant instance. *(met: restore into a volume-free instance, checked with `status`, scroll and search)*
 - The README documents the exact commands and caveats.
 
-### [ ] P2.4 Indexing vs query contention
+### [~] P2.4 Indexing vs query contention
 
 **Why:** bulk indexing and user queries share one GPU and one model; a large ingest delays search.
 
 **Scope:**
-- [ ] Measure search latency during a bulk ingest.
+- [x] Measure search latency during a bulk ingest.
 - [ ] Options: lower indexer batch size, sleep between batches, a priority queue in `api`, a separate embedding instance for indexing, or CPU embedding for the indexer.
-- [ ] Add a concurrency limit around `model.encode` so concurrent requests do not pile up.
-- [ ] Expose queue/latency metrics (at least in logs).
+- [x] Add a concurrency limit around `model.encode` so concurrent requests do not pile up.
+- [x] Expose queue/latency metrics (at least in logs).
 
 **Acceptance criteria:**
 - Search p95 latency stays within an agreed budget during indexing.
 - Indexing still completes in a reasonable time.
+
+**Notes:** `EMBEDDING_MAX_CONCURRENCY` (default `1`) wraps `model.encode` in an
+`asyncio.Semaphore` in `api/embedder.py`, so encode calls queue one at a time
+instead of competing for VRAM; the value is reported by `api` `/health`
+(`max_concurrency`). `scripts/latency_probe.py` measures `POST /search`
+p50/p95/p99 in three phases (idle, while synthetic documents are being indexed,
+settled) plus a 32-text `POST /embed` batch, and prints the multiplier under
+ingest. The first sample is in `eval/perf-probe.json`, measured while the
+baseline and gateway eval runs were also loading the API, so its absolute
+latencies are inflated; the idle-vs-ingest comparison on a quiet stack and the
+budget decision are still to be done, and the `api` container has to be rebuilt
+for the queue to take effect.
 
 ---
 
@@ -431,10 +444,10 @@ binaries. This is a high-priority foundation, before any bulk indexing.
 **Scope:**
 - [ ] Configurable include/exclude rules; honor `.gitignore` where appropriate, plus engine-specific rules.
 - [ ] Exclude `.git`, dependency directories, build outputs, caches, virtual environments, generated files, and binaries by default.
-- [ ] Detect file types instead of reading every file as UTF-8; handle encoding errors and oversized files safely (skip and report, never crash).
+- [ ] Detect file types instead of reading every file as UTF-8; handle encoding errors and oversized files safely (skip and report, never crash). Observed live: a Windows-1251 file was indexed as mojibake — its chunk text and title were unreadable `????` garbage, and the gateway would inject that into prompts.
 - [ ] Do not index secrets by default: `.env`, private keys, credentials, configurable secret patterns.
 - [ ] Make indexing idempotent; handle interrupted jobs and retries safely.
-- [ ] Track indexing status and errors per source; deletion or exclusion removes derived entries.
+- [ ] Track indexing status and errors per source; deletion or exclusion removes derived entries. Observed live: deleting a file immediately after it was created left one orphaned chunk (the queued index job ran after the delete event); startup reconciliation does not cover a running watcher race.
 - [ ] Treat retrieved content as untrusted data: it must never override system instructions or tool policies.
 
 **Acceptance criteria:**

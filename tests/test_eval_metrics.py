@@ -4,14 +4,17 @@ Run from the repository root:
 
     python -m unittest discover -s tests -p "test_*.py"
 
-No GPU, API, or Docker is involved: the tests work on synthetic hit lists.
+No GPU, API, or Docker is involved: the metric tests work on synthetic hit
+lists, and the HTTP session tests run against a local stub server on 127.0.0.1.
 """
 
 import base64
+import http.server
 import json
 import math
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -163,6 +166,15 @@ class SweepTests(unittest.TestCase):
         self.assertAlmostEqual(row["mrr@5"], (0.0 + 1 / 2) / 2)
         self.assertAlmostEqual(row["zero_context@5"], 0.0)
 
+    def test_markdown_renders_every_metric_table(self):
+        grid = ev.sweep(self.results, [3, 5], [0.5, ev.NO_THRESHOLD])
+        text = ev.sweep_markdown(grid, grid["top_ks"], "2026-01-01T00:00:00+00:00")
+        for metric in ("recall@3", "recall@5", "mrr@3", "injected@5", "zero_context@3"):
+            self.assertIn(metric, text)
+        self.assertIn("| off |", text)
+        self.assertIn("| 0.50 |", text)
+        self.assertEqual(text.count("## "), 4)
+
 
 class SourceHeaderTests(unittest.TestCase):
     def test_decode_unpadded_base64url(self):
@@ -265,6 +277,110 @@ class CorpusCheckTests(unittest.TestCase):
         questions = [{"id": "q1", "relevant": [{"file": "gone.md", "text_contains": "alpha"}]}]
         problems = ev.check_corpus(questions, self.corpus)
         self.assertTrue(any("not found" in problem for problem in problems))
+
+
+class _StubServer(http.server.HTTPServer):
+    """Local stub API: counts connections and bodies, no GPU, API, or Docker."""
+
+    def __init__(self, handler_class):
+        super().__init__(("127.0.0.1", 0), handler_class)
+        self.connections = 0
+        self.paths = []
+        self.bodies = []
+
+    def process_request(self, request, client_address):
+        self.connections += 1
+        return super().process_request(request, client_address)
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    # keep-alive is what the session relies on, so speak HTTP/1.1
+    protocol_version = "HTTP/1.1"
+    SOURCES = [{"file": "/data/documents/a.txt", "chunk": 2, "score": 0.61,
+               "section": "Guide > Setup"}]
+
+    def _reply(self, payload, extra_headers=None):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.server.bodies.append(json.loads(self.rfile.read(length)))
+        self.server.paths.append(self.path)
+
+        if self.path == "/boom":
+            self.send_response(422)
+            self.send_header("Content-Length", "17")
+            self.end_headers()
+            self.wfile.write(b'{"detail":"failed"}')
+        elif self.path == "/v1/chat/completions":
+            raw = base64.urlsafe_b64encode(
+                json.dumps(self.SOURCES).encode()
+            ).decode().rstrip("=")
+            self._reply(b"{}", {"X-RAG-Sources": raw})
+        else:
+            hit = {"file": "/data/documents/a.txt", "chunk": 2,
+                   "text": "Detail about gamma", "section": "Guide > Setup",
+                   "score": 0.61}
+            self._reply(json.dumps([hit]).encode())
+
+    def log_message(self, format, *args):  # keep the test output clean
+        pass
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        self.server = _StubServer(_StubHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.session = ev.Session(f"http://127.0.0.1:{self.server.server_port}", 10.0)
+
+    def tearDown(self):
+        self.session.close()
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_one_connection_serves_every_request(self):
+        for _ in range(3):
+            body, _headers = self.session.post(
+                "/search", {"query": "alpha", "top_k": 10, "min_score": None}
+            )
+            self.assertEqual(len(body), 1)
+        self.assertEqual(len(self.server.bodies), 3)
+        self.assertEqual(self.server.connections, 1)
+
+    def test_evaluate_search_reuses_the_connection(self):
+        questions = [{"id": "q1", "question": "alpha", "history": [],
+                      "relevant": [{"file": "a.txt", "text_contains": "gamma"}]}]
+        results = ev.evaluate_search(self.session, questions, 10)
+        self.assertEqual(results[0]["first_rank"], 1)
+        self.assertEqual(self.server.connections, 1)
+
+    def test_response_headers_are_normalized(self):
+        _body, headers = self.session.post(
+            "/v1/chat/completions", {"model": "stub", "messages": []}
+        )
+        self.assertIn("x-rag-sources", headers)
+        self.assertEqual(ev.sources_from_headers(headers), _StubHandler.SOURCES)
+
+    def test_non_2xx_reports_status_and_body(self):
+        with self.assertRaises(ev.HttpError) as raised:
+            self.session.post("/boom", {})
+        self.assertEqual(raised.exception.status, 422)
+        self.assertIn("failed", raised.exception.body)
+
+    def test_unreachable_host_is_reported(self):
+        dead = ev.Session("http://127.0.0.1:1", 2.0)
+        with self.assertRaises(ConnectionError):
+            dead.post("/search", {"query": "alpha", "top_k": 1, "min_score": None})
 
 
 if __name__ == "__main__":

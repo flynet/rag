@@ -181,14 +181,14 @@ so every needle exists in the collection. Measured with `top_k=50`,
 
 | Metric | Value | Recorded gate |
 |---|---|---|
-| recall@5 | 0.650 | — |
-| recall@10 | 0.767 | `--min-recall 0.70` |
-| MRR@10 | 0.396 | `--min-mrr 0.35` |
-| nDCG@10 | 0.526 | — |
+| recall@5 | 0.683 | — |
+| recall@10 | 0.800 | `--min-recall 0.70` |
+| MRR@10 | 0.414 | `--min-mrr 0.35` |
+| nDCG@10 | 0.557 | — |
 
 The gates sit just under the baseline, so they catch a regression without
 encoding the current quality as a target. `q-058` uses two `relevant` entries,
-which is what the acceptance criteria call a multi-chunk answer. 14 questions
+which is what the acceptance criteria call a multi-chunk answer. 12 questions
 have no expected hit in the top 10, and they concentrate on short table rows
 (`Current state`, the configuration table, memory limits) — dense embeddings do
 best on narrative and heading chunks, so this is the target of hybrid search

@@ -16,6 +16,10 @@ retrieved in one pass, so tuning does not cost one API run per configuration.
 `--corpus` validates the ground truth offline against the sample corpus, so a
 question set does not rot silently when the documents change.
 
+All requests reuse one keep-alive connection: on Windows a fresh TCP connection
+to a Docker-published port costs ~20 s, so opening one connection per question
+turns a 60-question run into 20 minutes of connection setup.
+
 See `eval/README.md` for the dataset format. The script is stdlib-only.
 
 Usage:
@@ -31,14 +35,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import math
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 DEFAULT_QUESTIONS = Path("eval/questions.jsonl")
 DEFAULT_API_URL = "http://localhost:8000"
@@ -60,22 +64,84 @@ _ALLOWED_EXPECTED_FIELDS = {"file", "chunk", "text_contains", "section"}
 # --------------------------------------------------------------------------- #
 
 
-def _open(url: str, payload: Optional[Dict[str, Any]], method: str,
-         headers: Dict[str, str], timeout: float):
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, method=method, headers=headers)
-    return urllib.request.urlopen(request, timeout=timeout)
+class HttpError(RuntimeError):
+    """A non-2xx response, reported with its status and a truncated body."""
+
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body}")
 
 
-def post_json(url: str, payload: Dict[str, Any], timeout: float,
-             headers: Optional[Dict[str, str]] = None) -> Any:
-    with _open(url, payload, "POST", headers or {"Content-Type": "application/json"}, timeout) as response:
-        return json.loads(response.read())
+class Session:
+    """One keep-alive connection reused for the whole run.
 
+    On Windows a fresh TCP connection to a Docker-published port costs ~20 s
+    (the port proxy wakes up) while a request on an open connection costs tens
+    of milliseconds. `urllib` opens one connection per request, so a 60-question
+    run spends 20 minutes in connection setup; reusing one connection makes the
+    same run take seconds.
+    """
 
-def get_json(url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Any:
-    with _open(url, None, "GET", headers or {}, timeout) as response:
-        return json.loads(response.read())
+    def __init__(self, base_url: str, timeout: float) -> None:
+        parts = urlsplit(base_url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise SystemExit(f"invalid base URL: {base_url!r} (use http://host:port)")
+        self.base_url = base_url
+        self.host = parts.hostname
+        self.port = parts.port or (443 if parts.scheme == "https" else 80)
+        self.timeout = timeout
+        self._https = parts.scheme == "https"
+        self._conn: Optional[http.client.HTTPConnection] = None
+
+    def _connect(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            factory = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+            self._conn = factory(self.host, self.port, timeout=self.timeout)
+        return self._conn
+
+    def _reset(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+    def close(self) -> None:
+        self._reset()
+
+    def request(self, path: str, payload: Optional[Dict[str, Any]],
+               headers: Dict[str, str]) -> Tuple[Any, Dict[str, str]]:
+        """Send one request and return the decoded body plus lowercased headers.
+
+        Uvicorn delivers header names lowercased, so they are normalized here.
+        A connection closed by the server is reopened once.
+        """
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        method = "POST" if payload is not None else "GET"
+        for attempt in (1, 2):
+            connection = self._connect()
+            try:
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                raw = response.read()
+            except (http.client.HTTPException, OSError) as exc:
+                self._reset()
+                if attempt == 2:
+                    raise ConnectionError(f"cannot reach {self.base_url}: {exc}") from exc
+                continue
+            if response.status >= 400:
+                raise HttpError(response.status, raw[:500].decode("utf-8", "replace"))
+            return json.loads(raw), {key.lower(): value for key, value in response.getheaders()}
+        raise ConnectionError(f"cannot reach {self.base_url}")
+
+    def post(self, path: str, payload: Dict[str, Any],
+             headers: Optional[Dict[str, str]] = None) -> Tuple[Any, Dict[str, str]]:
+        return self.request(path, payload, {"Content-Type": "application/json", **(headers or {})})
+
+    def get(self, path: str, headers: Optional[Dict[str, str]] = None) -> Tuple[Any, Dict[str, str]]:
+        return self.request(path, None, dict(headers or {}))
 
 
 def decode_sources(header: Optional[str]) -> List[Dict[str, Any]]:
@@ -317,15 +383,13 @@ def _normalize_search_hit(hit: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def evaluate_search(api_url: str, questions: List[Dict[str, Any]], top_k: int, timeout: float) -> List[Dict[str, Any]]:
-    search_url = f"{api_url.rstrip('/')}/search"
+def evaluate_search(session: Session, questions: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     for question in questions:
-        payload = post_json(
-            search_url,
+        payload, _ = session.post(
+            "/search",
             {"query": question["question"], "top_k": top_k, "min_score": None},
-            timeout,
         )
         if not isinstance(payload, list):
             raise RuntimeError(
@@ -355,25 +419,25 @@ def _build_result(question: Dict[str, Any], hits: List[Dict[str, Any]]) -> Dict[
     }
 
 
-def _resolve_model(gateway_url: str, api_key: str, model: Optional[str], timeout: float) -> str:
+def _resolve_model(session: Session, api_key: str, model: Optional[str]) -> str:
     if model:
         return model
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    listing = get_json(f"{gateway_url.rstrip('/')}/v1/models", timeout, headers)
+    listing, _ = session.get("/v1/models", headers)
     entries = listing.get("data") if isinstance(listing, dict) else None
     if not isinstance(entries, list) or not entries:
         raise RuntimeError(
-            f"no models at {gateway_url}/v1/models - set UPSTREAM_BASE_URL on the "
-            "gateway or pass --model"
+            f"no models at {session.base_url}/v1/models - set UPSTREAM_BASE_URL on "
+            "the gateway or pass --model"
         )
     first = entries[0].get("id") if isinstance(entries[0], dict) else None
     if not first:
-        raise RuntimeError(f"{gateway_url}/v1/models returned an unexpected entry")
+        raise RuntimeError(f"{session.base_url}/v1/models returned an unexpected entry")
     return str(first)
 
 
-def evaluate_gateway(gateway_url: str, api_key: str, model: str,
-                     questions: List[Dict[str, Any]], top_k: int, timeout: float) -> List[Dict[str, Any]]:
+def evaluate_gateway(session: Session, api_key: str, model: str,
+                     questions: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
     """Retrieve through the gateway and read `X-RAG-Sources` from the response.
 
     The request carries the `history` turns plus the question, exactly as an agent
@@ -382,7 +446,6 @@ def evaluate_gateway(gateway_url: str, api_key: str, model: str,
     `X-RAG-MIN-SCORE` is disabled, so the sweep can apply any configuration
     offline to the raw candidate list.
     """
-    chat_url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -397,14 +460,13 @@ def evaluate_gateway(gateway_url: str, api_key: str, model: str,
     for question in questions:
         messages = [{"role": "user", "content": turn} for turn in question["history"]]
         messages.append({"role": "user", "content": question["question"]})
-        data, response_headers = _post_chat(chat_url, headers, {
+        _, response_headers = session.post("/v1/chat/completions", {
             "model": model,
             "messages": messages,
             "stream": False,
             "max_tokens": 64,
             "temperature": 0,
-        }, timeout)
-        del data  # the answer text is not what is measured here
+        }, headers)
         hits = [
             {
                 "file": str(hit.get("file", "")),
@@ -423,15 +485,6 @@ def evaluate_gateway(gateway_url: str, api_key: str, model: str,
 def sources_from_headers(response_headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """Read `X-RAG-Sources` from normalized (lowercased) response headers."""
     return decode_sources(response_headers.get("x-rag-sources"))
-
-
-def _post_chat(chat_url: str, headers: Dict[str, str], payload: Dict[str, Any],
-              timeout: float) -> Tuple[Any, Dict[str, str]]:
-    with _open(chat_url, payload, "POST", headers, timeout) as response:
-        body = json.loads(response.read())
-        # header names are case-insensitive in HTTP, and uvicorn delivers them
-        # lowercased, so normalize them before reading the RAG headers
-        return body, {key.lower(): value for key, value in dict(response.headers).items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +588,39 @@ def print_sweep(grid: Dict[str, Any], top_ks: List[int]) -> None:
         print()
 
 
+def sweep_markdown(grid: Dict[str, Any], top_ks: List[int], generated_at: str) -> str:
+    """Markdown tables of the grid: recall, MRR, injected chunks, zero-context rate."""
+    blocks = (
+        ("recall", "Recall of the relevant chunk among the injected context"),
+        ("mrr", "MRR within the injected context (ranked within `top_k` only)"),
+        ("injected", "Average number of injected chunks per question"),
+        ("zero_context", "Fraction of questions that get no context at all"),
+    )
+    lines = [
+        "# Tuning sweep",
+        "",
+        "Generated by `python scripts/eval_retrieval.py --sweep --sweep-md eval/sweep.md`",
+        f"(generated at {generated_at}).",
+        "",
+        "The grid is applied offline to the candidates of one retrieval pass: `top_k` cuts",
+        "the list, `min_score` drops hits below the threshold, exactly as `POST /search` with",
+        "`score_threshold` and the gateway apply them. All numbers are averages over the",
+        "questions of the dataset.",
+        "",
+    ]
+    for metric, title in blocks:
+        lines.append(f"## {title}")
+        lines.append("")
+        lines.append("| min_score | " + " | ".join(f"{metric}@{k}" for k in top_ks) + " |")
+        lines.append("|" + "---|" * (len(top_ks) + 1))
+        for row in grid["rows"]:
+            label = "off" if row["min_score"] <= NO_THRESHOLD else f"{row['min_score']:.2f}"
+            cells = " | ".join(f"{row[f'{metric}@{k}']:.3f}" for k in top_ks)
+            lines.append(f"| {label} | {cells} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _parse_ks(value: str) -> List[int]:
     try:
         ks = sorted({int(part) for part in value.split(",") if part.strip()})
@@ -579,6 +665,8 @@ def main() -> int:
                         help="apply the top_k x min_score grid to the retrieved candidates")
     parser.add_argument("--sweep-top-k", default=DEFAULT_SWEEP_TOP_K)
     parser.add_argument("--sweep-min-score", default=DEFAULT_SWEEP_MIN_SCORE)
+    parser.add_argument("--sweep-md", default=None,
+                        help="write the sweep tables as Markdown to this file (requires --sweep)")
     parser.add_argument("--json-out", default=None)
     parser.add_argument("--min-recall", type=float, default=None,
                         help="exit 1 if recall@max(recall-k) is below this value")
@@ -594,6 +682,8 @@ def main() -> int:
     )
     if top_k < 1:
         parser.error("--top-k must be >= 1")
+    if args.sweep_md and not args.sweep:
+        parser.error("--sweep-md requires --sweep")
 
     questions = load_questions(Path(args.questions), gateway=gateway_mode)
     if args.limit is not None:
@@ -616,24 +706,25 @@ def main() -> int:
         print(f"{len(questions)} question(s) OK: {args.questions}")
         return 1 if corpus_problems else 0
 
+    base_url = args.gateway_url if gateway_mode else args.api_url
+    session = Session(base_url, args.timeout)
     try:
         if gateway_mode:
-            model = _resolve_model(args.gateway_url, args.api_key, args.model, args.timeout)
-            results = evaluate_gateway(args.gateway_url, args.api_key, model, questions, top_k, args.timeout)
-            base_url = args.gateway_url
+            model = _resolve_model(session, args.api_key, args.model)
+            results = evaluate_gateway(session, args.api_key, model, questions, top_k)
         else:
-            results = evaluate_search(args.api_url, questions, top_k, args.timeout)
-            base_url = args.api_url
-    except urllib.error.HTTPError as exc:
-        body = exc.read()[:500].decode("utf-8", "replace")
-        print(f"HTTP {exc.code} from {base_url}: {body}")
+            results = evaluate_search(session, questions, top_k)
+    except HttpError as exc:
+        print(f"HTTP {exc.status} from {base_url}: {exc.body}")
         return 1
-    except urllib.error.URLError as exc:
-        print(f"Cannot reach {base_url}: {exc.reason}")
+    except (ConnectionError, OSError) as exc:
+        print(f"Cannot reach {base_url}: {exc}")
         return 1
     except Exception as exc:  # noqa: BLE001 - report and exit non-zero
         print(f"Evaluation failed: {exc}")
         return 1
+    finally:
+        session.close()
 
     summary = summarise(results, args.recall_k, top_k)
     print_report(summary, results, args.recall_k, args.show_failures)
@@ -641,6 +732,13 @@ def main() -> int:
     grid = sweep(results, _parse_ks(args.sweep_top_k), _parse_scores(args.sweep_min_score)) if args.sweep else None
     if grid is not None:
         print_sweep(grid, grid["top_ks"])
+
+    if args.sweep_md:
+        md_path = Path(args.sweep_md)
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        md_path.write_text(sweep_markdown(grid, grid["top_ks"], stamp) + "\n", encoding="utf-8")
+        print(f"Wrote {md_path}")
 
     if args.json_out:
         serialisable = [{k: v for k, v in result.items() if k != "hits"} for result in results]

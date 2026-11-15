@@ -23,7 +23,7 @@ This is the state of the code in this repository, not a target design.
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
 | Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
 | Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
-| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; 60 questions + committed corpus; baseline `recall@5=0.65`, `recall@10=0.767`, `MRR@10=0.396`, `nDCG@10=0.526` |
+| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557` |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
@@ -150,7 +150,7 @@ Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this re
 
 ```powershell
 Copy-Item eval/corpus/* data/documents/
-docker compose up -d          # re-embeds the corpus, 192 chunks
+docker compose up -d          # re-embeds the corpus, 202 chunks
 python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus
 ```
 
