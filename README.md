@@ -11,55 +11,21 @@ OPENAI_API_KEY=<key from API_KEYS>
 
 There is no chat UI — the service exposes an API only. Any OpenAI-compatible client (OpenAI SDK, LangChain, Continue, Cline, etc.) can use it.
 
-## Current state
-
-This is the state of the code in this repository, not a target design.
-
-| Area | Current implementation |
-|---|---|
-| Embedding model | `Qwen/Qwen3-Embedding-0.6B`, 1024 dimensions, fp16 on GPU |
-| Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
-| Document encoding | Plain text, no instruction |
-| Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=8`, `RAG_MIN_SCORE=0.3` (measured with `--sweep`) |
-| Multi-turn queries | `RAG_QUERY_REWRITE=off|concat|llm`, default `concat`: with only the last user message embedded, 2 of 9 follow-up conversations have no expected hit in the top ten (`recall@10` `0.778`, `MRR@10` `0.277`); prepending the last 3 user turns closes both (`recall@10` `1.000`, `MRR@10` `0.420`) with no extra upstream call, so `concat` is the default; `llm` ranks higher (`MRR@10` `0.514`) and costs one extra upstream call per follow-up, so it stays opt-in |
-| Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
-| Retrieval evaluation | `scripts/eval_retrieval.py`: recall@k / MRR@10 / nDCG@10, `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation (in gateway mode `--corpus` rebuilds each chunk's text from `char_start:char_end`, so one dataset works in both modes); one keep-alive connection per run; 60 questions + committed corpus; baseline `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557`, measured identically through the gateway |
-| Reranking | None |
-| Hybrid / sparse search | None |
-| Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
-| Indexing | Startup reconciliation + scan, `watchdog`, signature-based incremental updates |
-| Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
-| Qdrant | `qdrant/qdrant:v1.20.1` pinned via `QDRANT_VERSION`; storage on a named volume, snapshots dir bind-mounted; no snapshot schedule |
-| Healthchecks | Gateway, `api`, and Qdrant; `embedder` waits for Qdrant and `api` |
-| Chat + RAG injection | Verified end to end against a self-hosted OpenAI-compatible server: non-stream and streaming answers cite the retrieved section, `X-RAG-Sources` / `X-RAG-Hits` headers are valid, `X-RAG: off` disables retrieval, unrelated questions produce 0 hits |
-| Startup E2E | `docker compose up -d` reaches healthy `qdrant`, `api`, `gateway` plus a running `embedder` on the RTX 4060 machine; `scripts/smoke_test.py` passes all 5 checks |
-| Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
-| Target hardware | One GPU, tested on RTX 4060 Laptop with 8 GB VRAM |
-
-The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
-
-**Direction:** the target is a local-first, model-agnostic knowledge and context service (Local Knowledge
-Engine): workspaces and collections for multiple products and repositories, specialized ingestion pipelines
-for documents and code, hybrid and structure-aware retrieval, context assembly with provenance, and
-access through REST, the OpenAI-compatible gateway, and MCP. Original files and Git stay authoritative; the
-index is a derived representation. Roadmap items P4-P10 in **[TODO.md](TODO.md)**; nothing in this section is
-implemented yet.
-
 ## Features
 
 - OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/v1/embeddings`
-- Automatic document indexing with file-change monitoring
-- Structure-aware chunking with section paths and character offsets for citations
-- RAG enabled by default: retrieved chunks are injected into the current user turn
-- Transparent passthrough of `tools`, `tool_calls`, `response_format`, `temperature`, and other OpenAI fields
-- Bearer authentication with static keys
-- The upstream key stays in the gateway; the agent's `Authorization` header is never forwarded
-- Per-request RAG control via `X-RAG-*` headers
-- Follow-up query rewriting (`RAG_QUERY_REWRITE=off|concat|llm`), `concat` by default
-- A single embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
-- Incremental indexing: unchanged files are skipped based on a stored signature
+- Automatic document indexing: startup reconciliation, `watchdog` file monitoring, incremental updates (unchanged files are skipped by a stored signature)
+- Structure-aware chunking (Markdown headings → paragraphs → sentences, 1024-character chunks, 128-character overlap) with section paths and character offsets for citations
+- RAG enabled by default: retrieved chunks are injected into the current user turn; retrieval is skipped inside agent tool loops
+- Per-request RAG control via `X-RAG-*` headers, sources returned in `X-RAG-Sources`
+- Follow-up query rewriting for short messages (`RAG_QUERY_REWRITE=off|concat|llm`, `concat` by default)
+- Bearer authentication with static keys; the upstream key never reaches the agent
+- One embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
+- GPU (fp16) or CPU embeddings
+- Qdrant vector database; snapshot backup and restore without re-embedding
+- Healthchecks on every service, `/health` with dependency status
 - Retrieval evaluation harness (`recall@k`, `MRR`, `nDCG`) with a JSONL question set
-- Qdrant vector database
+- Plain-text documents (UTF-8): `.txt`, `.md`, `.csv`, `.json`
 
 ## Architecture
 
@@ -135,37 +101,31 @@ implemented yet.
 │   ├── questions.jsonl          # the 60-question baseline dataset
 │   ├── questions.multiturn.jsonl# 9 follow-up conversations (history + short question)
 │   ├── questions.example.jsonl  # schema examples
-│   ├── corpus/                  # snapshot of the documents the baseline is measured on
+│   ├── corpus/                  # the sample documents the dataset is measured on
 │   ├── baseline.json            # committed baseline numbers + sweep grid
 │   ├── baseline-prompt-off.json # the same set with the query prompt disabled
 │   ├── gateway-singleturn-off.json      # 60 single-turn questions, rewrite off
-│   ├── gateway-singleturn-concat.json   # the same set, rewrite concat (no regression)
+│   ├── gateway-singleturn-concat.json   # the same set, rewrite concat
 │   ├── multiturn-off.json       # 9 follow-up conversations, rewrite off
-│   ├── multiturn-gateway.json   # the same set, rewrite concat (the default)
+│   ├── multiturn-gateway.json   # the same set, rewrite concat
 │   ├── multiturn-llm.json       # the same set, rewrite llm
-│   ├── sweep.md                 # top_k × min_score tables for the chosen defaults
+│   ├── sweep.md                 # top_k × min_score tables
 │   ├── sweep-prompt-off.md      # the same grid without the query instruction
-│   ├── sweep-multiturn.md       # the same grid on follow-up conversations (concat)
+│   ├── sweep-multiturn.md       # the same grid on follow-up conversations
 │   ├── sweep-multiturn-llm.md   # the same grid with the llm rewrite
 │   └── perf-probe.json          # measured search latency under ingest
 ├── tests/
 │   ├── test_eval_metrics.py     # unit tests for the eval math (no GPU/API needed)
-│   └── test_gateway_rewrite.py  # follow-up rewrite: single-turn guarantee, concat, llm fallback
+│   └── test_gateway_rewrite.py  # unit tests for follow-up query rewriting
 ├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
 └── TODO.md
 ```
 
-Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this repo. It lives on ext4 inside the Docker Desktop VM; a Windows bind mount goes through a 9p translation layer, which Qdrant reports as `"Unrecognized filesystem - cannot guarantee data safety"` and where its WAL gets corrupted. The snapshots directory is bind-mounted so snapshot files created via REST survive container recreation.
+Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this repo: Qdrant needs a filesystem it can guarantee data safety on, which a Windows bind mount is not. The snapshots directory is bind-mounted so snapshot files created via REST survive container recreation.
 
-`data/documents/` is git-ignored, so the documents the baseline was measured on are committed under `eval/corpus/`. Reproduce the baseline from a fresh clone:
-
-```powershell
-Copy-Item eval/corpus/* data/documents/
-docker compose up -d          # re-embeds the corpus, 202 chunks
-python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus
-```
+`data/documents/` is git-ignored. The sample documents used by the evaluation dataset are committed under `eval/corpus/`; see [eval/README.md](eval/README.md) for the dataset format and how to reproduce the baseline.
 
 ## Services
 
@@ -440,7 +400,7 @@ The response body stays strictly OpenAI-compatible, so retrieved sources are ret
 | `X-RAG-Hits` | number of injected chunks |
 | `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score","title?","section?","char_start?","char_end?"}]` |
 
-`title`, `section`, and character offsets are included when the indexed chunk has them (chunks indexed before the structure-aware chunker may not).
+`title`, `section`, and character offsets are included when the indexed chunk has them.
 
 Decoding:
 
@@ -475,39 +435,7 @@ If the `api` service is unavailable, the gateway does **not** break chat: the re
 - `concat` (default) — for short or elliptical messages ("and the second one?"), the last `RAG_REWRITE_HISTORY` user messages are joined with the current one.
 - `llm` — the gateway asks the upstream model to rewrite the message into a standalone query; this adds one upstream call, is bounded by `RAG_REWRITE_TIMEOUT`, and falls back to `concat` on failure.
 
-Measured on `eval/questions.multiturn.jsonl` (9 follow-up conversations through the
-gateway, 20 candidates, threshold disabled; committed as
-`eval/multiturn-off.json`, `eval/multiturn-gateway.json` (`concat`),
-`eval/multiturn-llm.json`, each recording the mode it ran with):
-
-| mode | recall@5 | recall@10 | MRR@10 | nDCG@10 | latency (avg / p95) |
-|---|---|---|---|---|---|
-| `off` | 0.667 | 0.778 | 0.277 | 0.392 | 4.45 s / 4.94 s |
-| `concat` | 0.778 | 1.000 | 0.420 | 0.770 | 6.08 s / 7.01 s |
-| `llm` | 0.889 | 1.000 | 0.514 | 0.781 | 4.09 s / 4.91 s |
-
-Elliptical follow-ups are the case the rewrite is for: without history two of the
-nine questions have no expected hit in the top ten at all. `concat` costs no extra
-upstream call, so it is the default; `llm` adds one call per rewritten follow-up,
-bounded by `RAG_REWRITE_TIMEOUT`, and buys a better ranking of the injected context
-(at the shipped `min_score=0.3` it keeps the relevant chunk in the injected
-`top_k=8` for all nine follow-ups, `concat` for eight, `off` for six —
-`eval/sweep-multiturn-llm.md`, `eval/sweep-multiturn.md`). The extra call is not
-separable from upstream load in these runs: latencies measured `4.09–6.08 s` average
-and `4.91–7.01 s` p95, with `llm` the fastest of the three, so the cost of `llm` is
-documented as one extra upstream call per follow-up, not as a measured number of
-milliseconds. The set is small
-and its ground truth is section-level, so the ordering is directional, not a law.
-Requests without history, and long non-elliptical questions, are never rewritten.
-Measured on the 60-question set through the gateway
-(`eval/gateway-singleturn-off.json`, `eval/gateway-singleturn-concat.json`): both
-modes give `recall@5` `0.683`, `recall@10` `0.800`, `MRR@10` `0.414`, `nDCG@10`
-`0.557`, with the same twelve top-10 failures as `eval/baseline.json` — enabling a
-rewrite mode does not move a single-turn answer (latency `4.33 s` avg / `5.01 s` p95
-`off`, `4.34 s` / `4.97 s` `concat`, no rewrite fired on that set). Tool loops are
-unchanged: retrieval still runs only for a fresh user turn. The rewrite is a
-heuristic: it resolves references ("it", "the second one"), not topics the user
-never stated.
+The rewrite fires only when the request carries a history and the last user message is short or elliptical; requests without history and long questions are sent unchanged. Mode comparison and measured numbers: [eval/README.md](eval/README.md).
 
 **Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, and `chars="start-end"` attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
@@ -553,7 +481,7 @@ Public, no authentication. Checks the model server and the `api` service.
 }
 ```
 
-`status` is `degraded` when at least one dependency is unavailable. If `UPSTREAM_BASE_URL` is empty, the gateway logs `CRITICAL`, reports `upstream.ok: false`, and returns `503` for chat requests instead of crashing.
+`status` is `degraded` when at least one dependency is unavailable. If `UPSTREAM_BASE_URL` is empty, `upstream.ok` is `false` and chat requests return `503`.
 
 ## Configuration
 
@@ -572,9 +500,9 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `EMBEDDING_MAX_SEQ_LENGTH` | `8192` | maximum tokens per text (the model supports 32k) |
 | `EMBED_BATCH_SIZE` | `32` | texts per embedding request (both indexing and API batching) |
 | `ENABLE_RAG` | `true` | global RAG switch |
-| `RAG_TOP_K` | `8` | chunks injected into the prompt; measured value (sweep), not a default |
-| `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; measured value (sweep), model-dependent |
-| `RAG_QUERY_REWRITE` | `concat` | follow-up query mode: `off`, `concat`, or `llm`; measured on the follow-up set |
+| `RAG_TOP_K` | `8` | chunks injected into the prompt |
+| `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; model-dependent, re-tune after changing the model |
+| `RAG_QUERY_REWRITE` | `concat` | follow-up query mode: `off`, `concat`, or `llm` |
 | `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
 | `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
 | `UPSTREAM_BASE_URL` | — | OpenAI-compatible server URL (`.../v1` or without) |
@@ -669,13 +597,13 @@ python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/
     --sweep --json-out eval/baseline.json
 ```
 
-For `Qwen3-Embedding-0.6B` the sweep picked `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` (recall@8 `0.783`, zero-context `0%`). The inherited `RAG_TOP_K=3` / `RAG_MIN_SCORE=0.5` measured recall@8 `0.483` and left 23% of questions with no injected context at all. `min_score` above `0.4` is not usable on this model: it removes more context than it filters. See [eval/README.md](eval/README.md) for how to read the sweep table.
+The shipped `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` come from that sweep on the sample corpus; the recorded grids are in [eval/README.md](eval/README.md).
 
 The model is downloaded into `./models/hf-cache` on first start and is reused across container restarts. Old weights are not deleted automatically; after switching, you can remove `models--google--embeddinggemma-300m` to free ~0.6 GB.
 
 ### Dependency pins
 
-Qwen3-Embedding requires `transformers>=4.51` (Qwen3 architecture support; older versions fail with `KeyError: 'qwen3'`). `api/requirements.txt` also pins `sentence-transformers<6` because sentence-transformers 6.x requires transformers 5.x, which this stack has not been tested with.
+Qwen3-Embedding requires `transformers>=4.51` (Qwen3 architecture support). `api/requirements.txt` pins `sentence-transformers>=5.0,<6`.
 
 ## Document indexing
 
@@ -711,33 +639,18 @@ docker compose logs -f embedder
 2026-11-15 13:14:40 INFO [embedder] Unchanged, skipping /data/documents/other.txt
 ```
 
-Reconciliation walks the `file` payload field of every point, so startup cost grows with the number of chunks in the collection. For very large collections this should be replaced with a facet query or a dedicated file manifest.
-
 ## Memory and performance
 
-The layout targets a single machine with one GPU (tested on an RTX 4060 Laptop, 8 GB VRAM).
+The layout targets a single machine with one GPU (tested on an RTX 4060 Laptop, 8 GB VRAM). The LLM lives on another host, so the local GPU is dedicated to embeddings.
 
-The embedding model used to be loaded twice — in `embedder` and in `api`: two sets of weights, two torch runtimes, two CUDA contexts on one GPU. Now only `api` loads the weights; `embedder` talks to it over HTTP and contains no torch.
-
-| Component | Before | Now |
-|---|---|---|
-| `embedder`: torch + CUDA | ~1.5 GB | — |
-| `embedder`: model weights | gemma-2-2b fp32 ≈ 10.4 GB | — |
-| `api`: torch + CUDA | ~1.5 GB | ~1.5 GB |
-| `api`: model weights | 10.4 GB | Qwen3-Embedding-0.6B fp16 ≈ 1.2 GB |
-| `qdrant` | ~0.2 GB | ~0.2 GB |
-| **Total host memory** | **≈ 26 GB** | **≈ 5.6 GB** |
-
-The LLM lives on another host, so the local GPU is dedicated to embeddings.
-
-Other decisions:
-
-- **fp16 instead of fp32** — half the weights and faster on tensor cores. On CPU, precision is forced to fp32 because fp16 is slow and unsupported by many ops.
-- **Vector normalization** (`EMBEDDING_NORMALIZE`, default `true`) — more stable cosine search.
+- **One model instance** — only `api` loads the weights; `embedder` requests vectors over HTTP and has no torch/CUDA. Host memory: `api` ≈ 1.5 GB (torch + CUDA) + Qwen3-Embedding-0.6B fp16 ≈ 1.2 GB, `qdrant` ≈ 0.2 GB.
+- **fp16** — half the weights and faster on tensor cores; on CPU, precision is forced to fp32.
+- **Vector normalization** (`EMBEDDING_NORMALIZE`, default `true`).
 - **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `chunking_version`, `model`); unchanged files are skipped at startup and on watcher events.
-- **Batching** — texts are sent to `api` in `EMBED_BATCH_SIZE` batches instead of the whole file at once.
-- **Memory limits** — `mem_limit` of 1 GB for `embedder` and 512 MB for `gateway` prevents runaway indexing from consuming the host.
+- **Batching** — texts are sent to `api` in `EMBED_BATCH_SIZE` batches.
+- **Memory limits** — `mem_limit` of 1 GB for `embedder` and 512 MB for `gateway`.
 - **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — less VRAM fragmentation.
+- **Serialized encode calls** (`EMBEDDING_MAX_CONCURRENCY=1`) — bulk indexing and chat queries queue instead of competing for VRAM.
 
 To free the GPU entirely, move embeddings to CPU:
 
@@ -746,18 +659,7 @@ EMBEDDING_DEVICE=cpu
 EMBEDDING_DTYPE=float32
 ```
 
-Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but background indexing and single queries are usually still tolerable.
-
-## Known limitations
-
-- **Small, self-referential evaluation set** — 60 questions over the project's own documents (5 files, 192 chunks). Real user documents and a held-out subset are still missing; 14 of 60 questions have no expected hit in the top 10, concentrated on short table rows and config lines (dense search misses exact keys).
-- **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
-- **No reranker** — the top-`k` dense results go straight into the prompt.
-- **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
-- **Single GPU service** — bulk indexing and user queries share the same model; encode calls are serialized by `EMBEDDING_MAX_CONCURRENCY` (default `1`), so indexing load shows up as search latency. No dynamic batching.
-- **Multi-turn follow-ups** — `RAG_QUERY_REWRITE` defaults to `concat`; the rewrite is a keyword heuristic that resolves references in short messages, not a topic model. Measured on 9 follow-ups, `concat` recovers the two elliptical questions that the raw last message misses, `llm` ranks higher at one extra upstream call per follow-up, and `off` leaves 2 of 9 follow-ups with no expected hit in the top ten. The follow-up set is small (9 conversations, section-level ground truth), so the ordering is directional.
-- **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
-- **Model-dependent threshold** — `RAG_MIN_SCORE` must be re-tuned after changing the embedding model.
+On CPU a smaller model (`google/embeddinggemma-300m` or `intfloat/multilingual-e5-small`) is the usual choice.
 
 ## Troubleshooting
 
@@ -779,9 +681,9 @@ python scripts/smoke_test.py --api-key <key>
 
 **Empty answers without context** — check `X-RAG-Hits` in the response: `0` means either the collection is empty (`/collection/info`) or all results scored below `RAG_MIN_SCORE`.
 
-**Model fails to load** — check Hugging Face access and disk space: `docker compose logs api | Select-String "Loading model"`. Qwen3-Embedding needs `transformers>=4.51`; older versions fail with `KeyError: 'qwen3'`.
+**Model fails to load** — check Hugging Face access and disk space: `docker compose logs api | Select-String "Loading model"`. `api/requirements.txt` pins the versions the model needs.
 
-**`CUDA out of memory`** — the embedding model does not fit in VRAM. Set `EMBEDDING_DEVICE=cpu`; the LLM is on another host, so the GPU is needed only for embeddings. Qwen3-Embedding-0.6B takes ≈ 1.2 GB in fp16.
+**`CUDA out of memory`** — the embedding model does not fit in VRAM. Set `EMBEDDING_DEVICE=cpu` (`EMBEDDING_DTYPE=float32`), or use a smaller model.
 
 **Indexing takes long to start** — a full pass runs on an empty collection and after a model or chunking change; otherwise `embedder` skips files with a matching signature.
 
@@ -839,19 +741,7 @@ how to read the sweep tables.
 
 ## Roadmap
 
-The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
-
-| Priority | Item | Status |
-|---|---|---|
-| P0 | Retrieval evaluation harness (recall@k, MRR, nDCG, sweep) | done, baseline committed |
-| P0 | Startup reconciliation of stale vectors | implemented, verification pending |
-| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set | done, measured values committed |
-| P1 | Reranker (retrieve 30–50, pass 5–8) | pending |
-| P1 | Structure-aware chunking and citation metadata | done, re-indexed |
-| P1 | Multi-turn query rewriting | done, `concat` by default: `recall@10` 0.778 → 1.000 on the follow-up set |
-| P2 | Hybrid BM25 + dense search with RRF | pending |
-| P2 | Healthchecks, pinned Qdrant version, snapshots | done |
-| P3 | TEI/vLLM backend, query cache, quantization, larger model, pgvector | pending |
+The prioritized development plan is in **[TODO.md](TODO.md)**.
 
 ## Useful links
 
