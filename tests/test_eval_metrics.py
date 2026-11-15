@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -308,7 +309,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     # keep-alive is what the session relies on, so speak HTTP/1.1
     protocol_version = "HTTP/1.1"
     SOURCES = [{"file": "/data/documents/a.txt", "chunk": 2, "score": 0.61,
-               "section": "Guide > Setup"}]
+               "section": "Guide > Setup", "char_start": 0, "char_end": 18}]
 
     def _reply(self, payload, extra_headers=None):
         self.send_response(200)
@@ -344,6 +345,17 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
                    "text": "Detail about gamma", "section": "Guide > Setup",
                    "score": 0.61}
             self._reply(json.dumps([hit]).encode())
+
+    def do_GET(self):
+        self.server.paths.append(self.path)
+        if self.path == "/health":
+            defaults = {"top_k": 8, "min_score": 0.3,
+                        "query_rewrite": "concat", "rewrite_history": 3}
+            self._reply(json.dumps({"status": "ok", "defaults": defaults}).encode())
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def log_message(self, format, *args):  # keep the test output clean
         pass
@@ -394,6 +406,71 @@ class SessionTests(unittest.TestCase):
         dead = ev.Session("http://127.0.0.1:1", 2.0)
         with self.assertRaises(ConnectionError):
             dead.post("/search", {"query": "alpha", "top_k": 1, "min_score": None})
+
+    def test_gateway_defaults_are_recorded(self):
+        defaults = ev.read_gateway_defaults(self.session, "")
+        self.assertEqual(defaults["query_rewrite"], "concat")
+        self.assertEqual(defaults["top_k"], 8)
+
+    def test_gateway_without_defaults_is_not_fatal(self):
+        # an older gateway, or /health behind a route that 404s, must not stop the run
+        with patch.object(self.session, "get", side_effect=ev.HttpError(404, "not found")):
+            self.assertEqual(ev.read_gateway_defaults(self.session, "sk-test"), {})
+
+
+class GatewayCorpusTests(unittest.TestCase):
+    """Gateway mode reads the chunk text back from the corpus via char offsets."""
+
+    def setUp(self):
+        self.server = _StubServer(_StubHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.session = ev.Session(f"http://127.0.0.1:{self.server.server_port}", 10.0)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.corpus = Path(self.tmp.name)
+        (self.corpus / "a.txt").write_bytes(b"Detail about gamma\nRest of the file\r\n")
+
+    def tearDown(self):
+        self.session.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_corpus_text_is_normalized_like_the_chunker(self):
+        texts = ev.corpus_texts(self.corpus)
+        self.assertEqual(texts["a.txt"], "Detail about gamma\nRest of the file\n")
+
+    def test_text_contains_is_accepted_in_gateway_mode_with_a_corpus(self):
+        path = self.corpus / "q.jsonl"
+        path.write_text(json.dumps({
+            "id": "q1", "question": "alpha",
+            "relevant": [{"file": "a.txt", "text_contains": "Detail about gamma"}],
+        }) + "\n", encoding="utf-8")
+        questions = ev.load_questions(path, gateway=True, corpus_available=True)
+        self.assertEqual(len(questions), 1)
+
+    def test_gateway_hit_is_matched_through_the_corpus_slice(self):
+        questions = [{"id": "q1", "question": "alpha", "history": [],
+                      "relevant": [{"file": "a.txt", "text_contains": "Detail about gamma"}]}]
+        results = ev.evaluate_gateway(self.session, "", "stub", questions, 20,
+                                      ev.corpus_texts(self.corpus))
+        hit = results[0]["hits"][0]
+        self.assertEqual(hit["text"], "Detail about gamma")
+        self.assertEqual(results[0]["first_rank"], 1)
+
+    def test_a_hit_from_a_file_outside_the_corpus_has_no_text(self):
+        questions = [{"id": "q1", "question": "alpha", "history": [],
+                      "relevant": [{"file": "a.txt", "text_contains": "Detail about gamma"}]}]
+        results = ev.evaluate_gateway(self.session, "", "stub", questions, 20, {})
+        self.assertEqual(results[0]["hits"][0]["text"], "")
+        self.assertIsNone(results[0]["first_rank"])
+
+    def test_an_expected_file_outside_the_corpus_does_not_match(self):
+        questions = [{"id": "q1", "question": "alpha", "history": [],
+                      "relevant": [{"file": "z.txt", "text_contains": "Detail about gamma"}]}]
+        results = ev.evaluate_gateway(self.session, "", "stub", questions, 20,
+                                      ev.corpus_texts(self.corpus))
+        self.assertIsNone(results[0]["first_rank"])
 
 
 class LatencyTests(unittest.TestCase):

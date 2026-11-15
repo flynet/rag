@@ -14,7 +14,9 @@ and nDCG@10. Two retrieval modes are supported:
 `--sweep` applies a `top_k` x `min_score` grid to the candidates already
 retrieved in one pass, so tuning does not cost one API run per configuration.
 `--corpus` validates the ground truth offline against the sample corpus, so a
-question set does not rot silently when the documents change.
+question set does not rot silently when the documents change. In gateway mode
+`--corpus` is also what makes `text_contains` usable: the harness slices the
+corpus file at `char_start:char_end` to recover the text of each retrieved chunk.
 
 All requests reuse one keep-alive connection: on Windows a fresh TCP connection
 to a Docker-published port costs ~20 s, so opening one connection per question
@@ -163,7 +165,7 @@ def _fail(where: str, message: str) -> None:
     raise SystemExit(f"{where}: {message}")
 
 
-def _validate_expected(entry: Any, where: str, gateway: bool) -> None:
+def _validate_expected(entry: Any, where: str, gateway: bool, corpus_available: bool = False) -> None:
     if not isinstance(entry, dict):
         _fail(where, "'relevant' entries must be JSON objects")
     unknown = set(entry) - _ALLOWED_EXPECTED_FIELDS
@@ -176,10 +178,11 @@ def _validate_expected(entry: Any, where: str, gateway: bool) -> None:
         _fail(where, "'file' must be a string")
     if "text_contains" in entry and not isinstance(entry["text_contains"], str):
         _fail(where, "'text_contains' must be a string")
-    if gateway and "text_contains" in entry:
-        # The gateway reports sources in a header without the chunk text, so
-        # ground truth in gateway mode can only use file / chunk.
-        _fail(where, "'text_contains' is not available in gateway mode; use 'file' and 'chunk'")
+    if gateway and "text_contains" in entry and not corpus_available:
+        # The gateway reports sources in a header without the chunk text. With
+        # `--corpus` the text is read back offline from the corpus file through
+        # the `char_start`/`char_end` offsets, so 'text_contains' works there.
+        _fail(where, "'text_contains' is not available in gateway mode without --corpus; use 'file' and 'chunk'")
     if "chunk" in entry:
         try:
             chunk = int(entry["chunk"])
@@ -190,7 +193,7 @@ def _validate_expected(entry: Any, where: str, gateway: bool) -> None:
         entry["chunk"] = chunk
 
 
-def load_questions(path: Path, gateway: bool = False) -> List[Dict[str, Any]]:
+def load_questions(path: Path, gateway: bool = False, corpus_available: bool = False) -> List[Dict[str, Any]]:
     if not path.is_file():
         _fail(
             str(path),
@@ -219,7 +222,7 @@ def load_questions(path: Path, gateway: bool = False) -> List[Dict[str, Any]]:
             if not isinstance(relevant, list) or not relevant:
                 _fail(where, "'relevant' must be a non-empty array")
             for entry in relevant:
-                _validate_expected(entry, where, gateway)
+                _validate_expected(entry, where, gateway, corpus_available)
 
             history = item.get("history", [])
             if not isinstance(history, list) or not all(isinstance(turn, str) for turn in history):
@@ -279,6 +282,25 @@ def check_corpus(questions: List[Dict[str, Any]], corpus_dir: Path) -> List[str]
                 if not any(all(s in text for s in segments) for text in texts):
                     problems.append(f"{question['id']}: section {needle!r} not in '{name}'")
     return problems
+
+
+def corpus_texts(corpus_dir: Path) -> Dict[str, str]:
+    """Map each corpus file name to its normalized text (CRLF/CR converted to LF).
+
+    The chunker records character offsets in the normalized text, so slicing this
+    text with `char_start`/`char_end` reproduces the chunk exactly. That is how
+    `text_contains` works in gateway mode, where the source header carries no text.
+    """
+    texts: Dict[str, str] = {}
+    for path in sorted(corpus_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        texts.setdefault(path.name, raw.replace("\r\n", "\n").replace("\r", "\n"))
+    return texts
 
 
 # --------------------------------------------------------------------------- #
@@ -441,8 +463,27 @@ def _resolve_model(session: Session, api_key: str, model: Optional[str]) -> str:
     return str(first)
 
 
+def read_gateway_defaults(session: Session, api_key: str) -> Dict[str, Any]:
+    """The gateway's effective RAG defaults, read from `/health`.
+
+    A committed eval run has to say which configuration produced its numbers:
+    the rewrite mode lives in the gateway process, not in the harness, and it
+    changes retrieval quality on follow-up questions. Returns {} when the
+    gateway does not report defaults, so a run against an older gateway still
+    completes.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        body, _ = session.get("/health", headers)
+    except (HttpError, ConnectionError, OSError, ValueError):
+        return {}
+    defaults = body.get("defaults") if isinstance(body, dict) else None
+    return defaults if isinstance(defaults, dict) else {}
+
+
 def evaluate_gateway(session: Session, api_key: str, model: str,
-                     questions: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+                     questions: List[Dict[str, Any]], top_k: int,
+                     texts: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """Retrieve through the gateway and read `X-RAG-Sources` from the response.
 
     The request carries the `history` turns plus the question, exactly as an agent
@@ -450,6 +491,10 @@ def evaluate_gateway(session: Session, api_key: str, model: str,
     part of what is measured. `X-RAG-TOP-K` is raised to the gateway cap and
     `X-RAG-MIN-SCORE` is disabled, so the sweep can apply any configuration
     offline to the raw candidate list.
+
+    `texts` maps corpus file names to normalized text. The header has no chunk
+    text, so each hit's text is sliced from the corpus by `char_start`/`char_end`;
+    that makes `text_contains` usable in gateway mode.
     """
     headers = {
         "Content-Type": "application/json",
@@ -474,16 +519,22 @@ def evaluate_gateway(session: Session, api_key: str, model: str,
             "temperature": 0,
         }, headers)
         latency = time.perf_counter() - start
-        hits = [
-            {
+        hits: List[Dict[str, Any]] = []
+        for hit in sources_from_headers(response_headers):
+            name = Path(str(hit.get("file", ""))).name
+            normalized = (texts or {}).get(name)
+            start_offset = hit.get("char_start")
+            end_offset = hit.get("char_end")
+            chunk_text = ""
+            if normalized is not None and isinstance(start_offset, int) and isinstance(end_offset, int):
+                chunk_text = normalized[start_offset:end_offset]
+            hits.append({
                 "file": str(hit.get("file", "")),
                 "chunk": int(hit.get("chunk", 0)),
-                "text": "",
+                "text": chunk_text,
                 "section": str(hit.get("section") or ""),
                 "score": float(hit.get("score", 0.0)),
-            }
-            for hit in sources_from_headers(response_headers)
-        ]
+            })
         results.append(_build_result(question, hits, latency))
 
     return results
@@ -701,15 +752,16 @@ def main() -> int:
     if args.sweep_md and not args.sweep:
         parser.error("--sweep-md requires --sweep")
 
-    questions = load_questions(Path(args.questions), gateway=gateway_mode)
+    corpus_dir = Path(args.corpus) if args.corpus else None
+    questions = load_questions(Path(args.questions), gateway=gateway_mode,
+                               corpus_available=corpus_dir is not None)
     if args.limit is not None:
         questions = questions[: max(0, args.limit)]
         if not questions:
             _fail(str(args.questions), "--limit removed all questions")
 
     corpus_problems: List[str] = []
-    if args.corpus:
-        corpus_dir = Path(args.corpus)
+    if corpus_dir:
         if not corpus_dir.is_dir():
             _fail(str(corpus_dir), "corpus directory not found")
         corpus_problems = check_corpus(questions, corpus_dir)
@@ -724,10 +776,13 @@ def main() -> int:
 
     base_url = args.gateway_url if gateway_mode else args.api_url
     session = Session(base_url, args.timeout)
+    gateway_defaults: Dict[str, Any] = {}
     try:
         if gateway_mode:
             model = _resolve_model(session, args.api_key, args.model)
-            results = evaluate_gateway(session, args.api_key, model, questions, top_k)
+            gateway_defaults = read_gateway_defaults(session, args.api_key)
+            results = evaluate_gateway(session, args.api_key, model, questions, top_k,
+                                       corpus_texts(corpus_dir) if corpus_dir else None)
         else:
             results = evaluate_search(session, questions, top_k)
     except HttpError as exc:
@@ -744,6 +799,9 @@ def main() -> int:
 
     summary = summarise(results, args.recall_k, top_k)
     print_report(summary, results, args.recall_k, args.show_failures)
+    if gateway_mode and gateway_defaults.get("query_rewrite"):
+        print(f"gateway rewrite: {gateway_defaults['query_rewrite']} "
+              f"(history={gateway_defaults.get('rewrite_history', '?')})")
 
     grid = sweep(results, _parse_ks(args.sweep_top_k), _parse_scores(args.sweep_min_score)) if args.sweep else None
     if grid is not None:
@@ -766,6 +824,9 @@ def main() -> int:
             **summary,
             "results": serialisable,
         }
+        if gateway_defaults:
+            # which gateway configuration produced these numbers
+            output["gateway_defaults"] = gateway_defaults
         if grid is not None:
             output["sweep"] = grid
         output_path = Path(args.json_out)
