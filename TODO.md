@@ -4,6 +4,38 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done
 
+## Product direction — Local Knowledge Engine
+
+**Target definition:** a local-first, model-agnostic knowledge and context service that indexes documents
+and software repositories through specialized pipelines, organizes them into workspaces and collections,
+retrieves information through hybrid and structure-aware search, and exposes that context to chatbots and
+AI agents through REST, OpenAI-compatible APIs, and MCP, while keeping original files and Git as the
+source of truth.
+
+Three use cases share one platform:
+
+1. **Knowledge base / Oracle** — grounded answers about a product or subject (docs, PDFs, manuals, text) with source references.
+2. **Coding agent context engine** — relevant code, symbols, docs, dependencies, and tests for agents such as OpenCode working on large repositories.
+3. **General local knowledge service** — the same index exposed to chatbots, local assistants, and custom Python/Java applications.
+
+**Core architectural principle:** one platform and shared infrastructure, with specialized ingestion,
+parsing, chunking, and retrieval strategies per data type. Do not build separate products for PDF RAG,
+documentation RAG, Java RAG, and Python RAG, and do not force every format through one generic parser.
+
+**Division of responsibilities:**
+
+- **Knowledge Engine:** indexes sources, stores searchable representations, retrieves, assembles context, exposes APIs/tools.
+- **Coding agent / harness (OpenCode, DSH):** plans work, decides what information it needs, reads and edits files, runs commands and tests, manages its tool loop.
+- **Original files and Git:** authoritative for current content. The index is a derived searchable representation, never a replacement for files.
+- **LLM / inference server:** generates answers or code; the engine works with any OpenAI-compatible endpoint.
+
+Retrieved content is **untrusted data**: it must never override system instructions or tool policies. For
+code tasks, the agent must be able to open the original file and verify current content before editing, so
+every result carries provenance (path, line/page, revision, content hash).
+
+Items **P4–P10** are this direction. **P4.3** (safe indexing) is the foundation to finish before pointing
+the engine at whole repositories. P0–P3 stay the quality/reliability spine that every new phase depends on.
+
 ## Priority overview
 
 | ID | Item | Priority | Effort | Why |
@@ -23,6 +55,30 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 | P3.3 | Quantization / payload index | P3 | S | Only matters as the corpus grows |
 | P3.4 | Larger embedding model (4B/8B) | P3 | L | Quality, but needs more VRAM |
 | P3.5 | PostgreSQL + pgvector migration | P3 | L | Optional infrastructure consolidation |
+| P4.1 | Workspaces, collections, source registry, metadata schema | P4 | M | Multi-project isolation is the base for everything else |
+| P4.2 | Ingestion contract with specialized pipelines | P4 | M | New formats without rewriting the core |
+| P4.3 | Safe indexing (include/exclude, secrets, encodings, status) | P4 | M | Foundation before indexing whole repos |
+| P5.1 | PDF/DOCX/HTML/TXT extraction with page provenance | P5 | M | Document Oracle needs real formats, not just Markdown |
+| P5.2 | Citation data in retrieval responses | P5 | S | Grounded answers need traceable sources |
+| P6.1 | Code pipeline: Tree-sitter chunking by symbol units | P6 | L | Symbol-sized chunks beat text windows |
+| P6.2 | Symbol index and exact symbol lookup | P6 | M | `find_symbol` / `get_symbol` for agents |
+| P6.3 | References, dependencies, related tests | P6 | L | Context assembly for code tasks |
+| P6.4 | Git-aware freshness and invalidation | P6 | M | Index must track the repository revision |
+| P7.1 | Metadata filtering in retrieval | P7 | M | Scoped search, no cross-collection leaks |
+| P7.2 | Context assembly with token budget | P7 | M | Not a flat list of chunks |
+| P7.3 | Exact lookup by metadata | P7 | S | Identifiers, paths, symbols |
+| P7.4 | Evaluation set for code queries | P7 | M | Code retrieval needs its own quality gate |
+| P7.5 | Embedding profiles per collection | P7 | M | Different models for docs and code |
+| P8.1 | MCP server with retrieval tools | P8 | M | Agents decide when they need context |
+| P8.2 | Gateway injection behavior spec | P8 | M | Tool loops must not re-inject blindly |
+| P8.3 | Real coding-agent integration test | P8 | S | Proof that the contract works end to end |
+| P9.1 | Index freshness (content hash, parser and index versions) | P9 | M | Stale records must be detectable |
+| P9.2 | Retrieval cache with explicit invalidation | P9 | S | Repeated queries, no cross-scope leaks |
+| P9.3 | Context/prompt cache rules | P9 | M | Validate freshness before reuse |
+| P10.1 | Per-source indexing status, logs, and metrics | P10 | M | Operators need to see what is indexed and why not |
+| P10.2 | Backup and restore for the metadata layer | P10 | S | The registry is as critical as the vectors |
+| P10.3 | Configurable embedding and reranker providers | P10 | M | Model-agnostic by configuration |
+| P10.4 | Access isolation for multiple clients | P10 | M | Per-client scope and key permissions |
 
 ---
 
@@ -153,6 +209,7 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 - [ ] Migrate the collection to named vectors: `dense` (1024) + `bm25` (sparse).
 - [ ] Compute sparse vectors with FastEmbed `Qdrant/bm25` (add the dependency to both services that write vectors).
 - [ ] Query with Qdrant `prefetch` for both branches and `FusionQuery(fusion=RRF)`.
+- [ ] Apply workspace/collection/source/type filters to both branches (shared with P4.1).
 - [ ] Re-index the corpus; keep the model/chunker signature in the payload.
 - [ ] Evaluate on identifier-heavy questions vs dense-only.
 
@@ -182,7 +239,7 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. E2E (`docker compose up` with the GPU stack) is still pending because Docker Desktop is not running here.
 
-### [~] P2.3 Qdrant snapshots and restore — implemented, restore test pending live run
+### [x] P2.3 Qdrant snapshots and restore — done, restore verified live
 
 **Why:** the index can be rebuilt, but that costs GPU time and a full re-index.
 
@@ -194,20 +251,32 @@ the file with a sha256 checksum (`POST /collections/{name}/snapshots/upload`), p
 collection state before and after, and refuses to run without `--yes` because it overwrites
 the collection. The README documents the procedure, retention and caveats (version pin,
 restore with `embedder` stopped, full snapshots restored via the `--snapshot` boot flag).
+
 **Verified:** the protocol against a local stub Qdrant (create → download → prune → list →
 restore into a fresh collection, restore guard without `--yes`, node checksum rejection,
-missing file). **Not verified:** restore against a real Qdrant container.
+missing file), and then against a real Qdrant container: 12 points seeded → `create` →
+258 KB snapshot with a checksum on the node plus a copy in `backups/` → `docker compose
+down -v` (volume removed) → `up -d qdrant` → `status` reports `missing` → `restore --file
+... --yes` → `status` reports `green, points=12, dim=1024` → a scroll by `payload.file` and
+a `points/query` search returned the restored chunk with score 1.0.
+
+**Storage lesson baked into the compose file:** the collection snapshot contains the WAL
+(`0/wal/first-index`). On a Windows bind mount (`./qdrant_data:/qdrant/storage`) that file
+came out as NUL bytes, so the snapshot restored only into the same instance; Qdrant itself
+warned there: `Unrecognized filesystem - cannot guarantee data safety`. On a Linux named
+volume `first-index` is valid JSON and the snapshot restores into any instance. Storage is
+therefore a named volume, and `./qdrant_snapshots` is bind-mounted so node snapshots persist.
 
 **Scope:**
 - [x] Document and script a snapshot procedure (`POST /collections/{name}/snapshots?wait=true`, download, prune)
 - [x] Define retention (keep the last N snapshots on the node, `--keep`, default 5)
 - [x] Keep a copy outside the volume (`backups/`, git-ignored) so it survives a container rebuild
 - [x] Document the restore procedure (upload endpoint, checksum, `--yes` guard, caveats)
-- [ ] Perform and document a restore test (`E2E: docker required`)
+- [x] Perform and document a restore test (live run on `qdrant/qdrant:v1.20.1`)
 - [ ] Optionally add a scheduled snapshot job with a checksum and an off-host copy
 
 **Acceptance criteria:**
-- A snapshot can be restored into a fresh Qdrant instance.
+- A snapshot can be restored into a fresh Qdrant instance. *(met: restore into a volume-free instance, checked with `status`, scroll and search)*
 - The README documents the exact commands and caveats.
 
 ### [ ] P2.4 Indexing vs query contention
@@ -252,10 +321,12 @@ missing file). **Not verified:** restore against a real Qdrant container.
 - [ ] Bound memory (vectors are ~4 KB each at 1024 dims).
 - [ ] Add hit/miss counters to `/health` or logs.
 - [ ] Consider caching at the gateway for full user messages.
+- [ ] For result caching (P9.2), keys must include retrieval configuration, workspace/collection filters, embedding profile, and index version/state.
 
 **Acceptance criteria:**
 - Repeated identical queries hit the cache and skip `model.encode`.
 - Memory stays bounded under a long-running workload.
+- Cached results are never returned for a different workspace/collection scope.
 
 ### [ ] P3.3 Qdrant quantization and payload indexes
 
@@ -306,6 +377,333 @@ missing file). **Not verified:** restore against a real Qdrant container.
 
 ---
 
+## P4 — Knowledge core (workspaces, collections, sources, pipelines)
+
+### [ ] P4.1 Workspaces, collections, source registry, metadata schema
+
+**Why:** one global collection `documents` cannot serve several products, projects, and repositories in one
+installation; agents need scoped retrieval.
+
+**Concepts:**
+
+- **Workspace** — top-level organizational and access/filtering boundary.
+- **Collection** — a logical knowledge set (one product documentation set, one code repository).
+- **Source** — a registered file, directory, repository, or other ingestible origin.
+- **Document/chunk** — extracted and indexed content derived from a source.
+- **Index profile** — parser, chunking, and embedding configuration used for a source or collection.
+
+**Scope:**
+- [ ] Metadata baseline: `workspace_id`, `collection_id`, `source_id`, `source_path`, `source_type` (`document|code|text`), `file_type`, `language`, `chunk_type` (`section|page|class|method|function`), `content_hash`, `indexed_at`, `parser_version`, `embedding_profile`, plus page number and line range.
+- [ ] Code payload additions: symbol name, qualified symbol, imports, repository revision when available.
+- [ ] A metadata DB for source records, jobs, configuration, and index state. SQLite is the local-first starting point: one file, no server, trivial backup.
+- [ ] `api` `/search` gains optional `workspace` / `collection` filters; add Qdrant payload indexes on these fields (P3.3).
+- [ ] Source lifecycle: register, index, refresh, remove; removal deletes derived index entries.
+
+**Acceptance criteria:**
+- Two collections are managed and searched through one service with no cross-leak: a scoped query never returns results from another workspace/collection.
+- Adding a collection does not require re-indexing the others.
+- The logical Workspace/Collection abstraction stays independent from the physical Qdrant layout.
+
+**Notes:** start with one shared physical collection plus mandatory metadata filters for compatible vector
+configurations. Never mix incompatible vector dimensions or embedding models in one vector field: use
+separate collections or named vector fields (P7.5). Keep original files where they are; do not duplicate
+sources into Qdrant. Field names and indexing strategy are finalized during implementation design.
+
+### [ ] P4.2 Ingestion contract with specialized pipelines
+
+**Why:** PDF, Markdown, and code need different parsers and chunkers; one generic chunker pollutes the index.
+
+**Scope:**
+- [ ] Common ingestion contract as separate stages: discovery → extraction → normalization → chunking → embedding → storage.
+- [ ] Processor registry keyed by `source_type` / `file_type`, with a generic text fallback for formats without a specialized parser.
+- [ ] `parser_version` per processor; bumping it triggers re-indexing of affected sources (`CHUNKER_VERSION` in `embedder/chunking.py` becomes per-pipeline).
+- [ ] Document and code pipelines share platform services (embedding, storage, retrieval) and keep specialized parsing.
+
+**Acceptance criteria:**
+- Adding a new format means adding a processor, not changing the core.
+- Pipeline selection is recorded in metadata (`source_type`, `parser_version`) and visible per source.
+
+### [ ] P4.3 Safe indexing foundation
+
+**Why:** pointing the engine at a real repository without filters indexes secrets, build outputs, and
+binaries. This is a high-priority foundation, before any bulk indexing.
+
+**Scope:**
+- [ ] Configurable include/exclude rules; honor `.gitignore` where appropriate, plus engine-specific rules.
+- [ ] Exclude `.git`, dependency directories, build outputs, caches, virtual environments, generated files, and binaries by default.
+- [ ] Detect file types instead of reading every file as UTF-8; handle encoding errors and oversized files safely (skip and report, never crash).
+- [ ] Do not index secrets by default: `.env`, private keys, credentials, configurable secret patterns.
+- [ ] Make indexing idempotent; handle interrupted jobs and retries safely.
+- [ ] Track indexing status and errors per source; deletion or exclusion removes derived entries.
+- [ ] Treat retrieved content as untrusted data: it must never override system instructions or tool policies.
+
+**Acceptance criteria:**
+- Pointing at a real repository yields no secrets, no build outputs, no binary chunks, and no indexing crash.
+- Removing a source removes its chunks; re-indexing the same source produces no duplicates.
+- Per-source status and errors are queryable (P10.1).
+
+---
+
+## P5 — Document intelligence
+
+### [ ] P5.1 Format extraction with provenance (PDF, DOCX, HTML, TXT)
+
+**Why:** a documentation Oracle needs real formats, not only Markdown and text.
+
+**Scope:**
+- [ ] Page-aware PDF extraction; add OCR only where required.
+- [ ] DOCX and HTML extraction where initial use cases need it; keep the TXT path.
+- [ ] Preserve titles, headings, page numbers, and source locations in chunks (extend the P1.2 structure-aware chunking).
+- [ ] Extract product, document version, and language from filenames and metadata where available.
+
+**Acceptance criteria:**
+- A PDF answer cites the page; a Markdown answer cites the section.
+- Unsupported and binary files are skipped with a recorded reason, never a crash.
+
+### [ ] P5.2 Citation data in retrieval responses
+
+**Why:** grounded answers must show traceable sources.
+
+**Scope:**
+- [ ] Extend the retrieval response and `X-RAG-Sources` with `workspace_id`, `collection_id`, `source_path`, page/section, and content hash.
+- [ ] The gateway labels each passage with file and location so the answer can cite it.
+
+**Acceptance criteria:** an answer can be checked against the exact source location it cites.
+
+---
+
+## P6 — Code intelligence
+
+### [ ] P6.1 Tree-sitter chunking by symbol units
+
+**Why:** arbitrary text windows split functions and lose symbols; code retrieval quality depends on symbol-sized chunks.
+
+**Scope:**
+- [ ] Repository discovery with ignore rules; language and file-type detection.
+- [ ] Syntax-aware parsing with Tree-sitter (or an equivalent parser framework) per language.
+- [ ] Chunk by meaningful units: classes, methods, functions, interfaces, modules (not text windows alone).
+- [ ] Preserve symbol name, qualified name, file path, line range, language, and imports.
+
+**Acceptance criteria:**
+- One language indexed end to end, with symbol and line-range provenance in every chunk.
+- Code evaluation (P7.4) improves over text-window chunking.
+
+### [ ] P6.2 Symbol index and exact symbol lookup
+
+**Why:** agents ask for a class, method, or identifier, not for a semantic neighborhood.
+
+**Scope:**
+- [ ] Initial symbol index: name, qualified name, file, line range, kind.
+- [ ] Exact lookup by symbol, qualified symbol, and identifier (`find_symbol`, `get_symbol`).
+
+**Acceptance criteria:** an agent locates a class/method and gets full source locations without guessing file paths.
+
+### [ ] P6.3 References, dependencies, related tests
+
+**Why:** editing code needs its surroundings, not one isolated chunk.
+
+**Scope:**
+- [ ] Add reference and dependency relationships progressively.
+- [ ] Assemble related interfaces/implementations, imports, usages, and tests into a context package.
+
+**Acceptance criteria:** a code context package includes the relevant symbol plus dependencies and tests, each with path and line range.
+
+### [ ] P6.4 Git-aware freshness
+
+**Why:** the index must reflect the repository revision, not a stale snapshot.
+
+**Scope:**
+- [ ] Track repository identity and the indexed commit/revision where available.
+- [ ] Detect changed, added, renamed, and deleted files; invalidate affected chunks, symbols, references, and retrieval-cache entries.
+- [ ] Support a forced full re-index.
+- [ ] Document whether the index reflects HEAD, the working tree, or both, and handle uncommitted changes where feasible.
+
+**Acceptance criteria:** after a checkout or commit, the index reports the revision it reflects; changed files re-index and deleted files disappear from search.
+
+---
+
+## P7 — Retrieval engine v2
+
+### [ ] P7.1 Metadata filtering in retrieval
+
+**Why:** scope isolation is a core requirement, not a feature.
+
+**Scope:**
+- [ ] Workspace/collection/source/type filters applied before or during retrieval, in both dense and sparse branches (P2.1).
+- [ ] Configurable result limits and score thresholds per request.
+
+**Acceptance criteria:** a scoped query returns only in-scope results; unscoped behavior stays as today.
+
+### [ ] P7.2 Context assembly with a token budget
+
+**Why:** a flat list of similar chunks is not a usable context package.
+
+**Scope:**
+- [ ] Assemble from retrieved results: passages with section headings, document title/version, page, citation references; for code, symbols, dependencies, tests, line ranges, revision/content hashes for freshness validation.
+- [ ] Respect a configurable token/size budget and drop near-duplicate chunks.
+
+**Acceptance criteria:** assembled context fits the budget, contains no near-duplicates, and every item has provenance.
+
+### [ ] P7.3 Exact lookup by metadata
+
+**Scope:**
+- [ ] Lookup by source path, symbol, qualified symbol, identifier, and other exact metadata.
+
+**Acceptance criteria:** exact-term lookups return the source location without embedding similarity.
+
+### [ ] P7.4 Evaluation set for code queries
+
+**Why:** code retrieval has different ground truth than documentation.
+
+**Scope:**
+- [ ] Extend `eval/questions.jsonl` with code questions: symbol location, function behavior, dependency questions.
+- [ ] Ground truth: file plus symbol/line range.
+
+**Acceptance criteria:** code metrics (recall@k, MRR@10) are reported separately from document metrics and gated.
+
+### [ ] P7.5 Embedding profiles per collection
+
+**Why:** documentation and code may need different models and prompting.
+
+**Scope:**
+- [ ] Configurable embedding profile per collection (model, prompt name, dimension) recorded in metadata.
+- [ ] Named vector fields per profile; never mix incompatible dimensions in one field.
+- [ ] Cache keys include the embedding profile (P3.2, P9.2).
+
+**Acceptance criteria:** two collections use different models; a query uses the profile of its scope; quality is measured per profile.
+
+---
+
+## P8 — Agent integration
+
+### [ ] P8.1 MCP server with retrieval tools
+
+**Why:** coding agents should decide when they need context, not receive blind injections.
+
+**Scope:**
+- [ ] MCP server exposing retrieval tools: `search_knowledge`, `search_code`, `find_symbol`, `get_symbol`, `find_references` (after reference indexing), `get_file_structure`, `get_source_metadata`.
+- [ ] Tool results include source paths, line/page locations, content hashes or revision, and clear result types.
+- [ ] Retrieval aids only: the agent keeps using its own filesystem and terminal tools for reading, editing, and testing.
+
+**Acceptance criteria:** an MCP client can search and locate symbols in a registered repository and cite paths/lines from the results.
+
+### [ ] P8.2 Gateway injection behavior spec
+
+**Why:** tool-loop requests must not re-inject the same context on every iteration.
+
+**Scope:**
+- [ ] Document exactly when retrieval is triggered and how content is injected.
+- [ ] Configurable retrieval scope (workspace, collection, source type).
+- [ ] Decide retrieval on the initial user turn, on selected subsequent turns, or through explicit agent tools; preserve streaming; handle tool calls and tool-loop messages correctly.
+- [ ] Keep the OpenAI-compatible gateway contract; integrate multi-turn rewriting (P1.3).
+
+**Acceptance criteria:** documented behavior matches implementation and tests, including the tool-loop case.
+
+### [ ] P8.3 Real coding-agent integration test
+
+**Scope:**
+- [ ] Drive one task with a coding agent (OpenCode) against a registered repository: locate code, read the original file, edit, run tests.
+
+**Acceptance criteria:** a recorded session where the agent uses engine retrieval and verifies against original files.
+
+---
+
+## P9 — Caching and freshness
+
+Three mechanisms solve different problems; do not conflate them.
+
+### [ ] P9.1 Persistent index freshness
+
+**Scope:**
+- [ ] Content hashes plus parser and index versions identify stale records.
+- [ ] Incremental updates when sources change; explicit stale/refresh reporting per source.
+
+**Acceptance criteria:** a source whose content hash changed is marked stale and re-indexed automatically.
+
+### [ ] P9.2 Retrieval cache
+
+**Why:** repeated queries re-run embedding and search; caching helps only if keys cover the scope.
+
+**Scope:**
+- [ ] Cache search results for repeated queries; keys include query, retrieval configuration, workspace/collection filters, embedding profile, and index version/state.
+- [ ] Invalidate or bypass the cache when affected content or index configuration changes; never return cached results from a different scope.
+
+**Acceptance criteria:** repeated queries skip work; a re-index invalidates affected entries; cross-scope leakage is impossible.
+
+### [ ] P9.3 Context/prompt cache rules
+
+**Scope:**
+- [ ] Reuse assembled context only after validating source freshness.
+- [ ] Treat model-side prefix/prompt caching as an inference-server capability, not a RAG feature; do not claim Qdrant provides LLM prompt caching.
+
+**Acceptance criteria:** reused context is freshness-checked; documentation does not overstate prompt caching.
+
+---
+
+## P10 — Operability and extensibility
+
+### [ ] P10.1 Per-source status, logs, and metrics
+
+**Why:** bulk indexing over many sources fails partially; silent failure is worse than a loud one.
+
+**Scope:**
+- [ ] Status, errors, and progress per source (registry + structured logs).
+- [ ] Index size, staleness, cache hits, and latency in health/metrics endpoints.
+
+**Acceptance criteria:** "what is indexed, what failed, what is stale" is answerable from the API.
+
+### [ ] P10.2 Backup and restore for the metadata layer
+
+**Why:** the source registry is as critical as the vectors.
+
+**Scope:**
+- [ ] Backup and restore the metadata DB together with Qdrant snapshots (P2.3): same version discipline, checksum, confirmation guard, off-host copy.
+
+**Acceptance criteria:** a restore brings back registry and vectors consistently.
+
+### [ ] P10.3 Configurable embedding and reranker providers
+
+**Why:** the engine must be model-agnostic, not tied to one sentence-transformers path.
+
+**Scope:**
+- [ ] Embedding and reranking behind interfaces with multiple implementations: sentence-transformers, TEI/vLLM (P3.1), external OpenAI-compatible embedding endpoints, selected by configuration.
+
+**Acceptance criteria:** switching a provider is a configuration change, not a code change; profiles recorded per collection.
+
+### [ ] P10.4 Access isolation for multiple clients
+
+**Scope:**
+- [ ] Per-client keys with workspace/collection permissions, enforced in gateway and API.
+
+**Acceptance criteria:** a client cannot retrieve outside its granted scope.
+
+---
+
+## Non-goals (initial scope)
+
+- Multi-user SaaS, accounts, web UI, cloud sync, distributed scaling.
+- Autonomous agent planning inside the engine: the agent plans, the engine supplies context.
+- The index as a replacement for files, Git, `grep`, LSP, IDE tools, or the agent's own filesystem tools.
+- Fine-tuning, knowledge graphs, multimodal indexing, multi-agent orchestration, full-text search servers, code execution/sandboxing, semantic memory with LLM summarization: deferred until the basic engine is proven.
+- Treating prefix/prompt caching as a feature of the RAG service.
+- Replacing the OpenAI-compatible gateway with an MCP-only architecture.
+- Premature microservice splitting; local-first simplicity wins.
+
+## Open design decisions
+
+- Qdrant layout: shared collection with filters, per-collection collections, named vector fields.
+- Metadata DB choice (SQLite first) and its schema; where source registry, index profiles, and jobs live.
+- Exact metadata field names and payload indexing strategy.
+- Context assembly format and token budget defaults.
+- MCP tool surface naming and transport.
+- Git working-tree handling and secret rule defaults.
+- Embedding profiles per data type; reranker choice.
+- Cache invalidation mechanism and cache storage location.
+- Workspace/collection permission model for multiple clients.
+- How index freshness is exposed to clients (API, MCP, response headers).
+
+---
+
 ## Done
 
 - [x] Replace `google/embeddinggemma-300m` with `Qwen/Qwen3-Embedding-0.6B`.
@@ -313,6 +711,9 @@ missing file). **Not verified:** restore against a real Qdrant container.
 - [x] Pin `transformers>=4.51,<5` and `sentence-transformers>=5.0,<6`.
 - [x] Cap embedding input at 8192 tokens and raise the readiness wait to ~10 minutes.
 - [x] Expose `query_prompt` and the effective dimension in `api` `/health`.
+- [x] Snapshot restore proven live: a snapshot taken on a Linux named volume restores into a
+      fresh Qdrant instance (`status` + `points/query` verified); a snapshot created on a
+      Windows bind mount carries a corrupted WAL `first-index` and cannot be relied on.
 - [x] Document the current state, limitations, and roadmap in English (`README.md`, `TODO.md`).
 
 ## Conventions
@@ -321,3 +722,13 @@ missing file). **Not verified:** restore against a real Qdrant container.
 - Any retrieval-quality change must include evaluation numbers (before/after).
 - Any schema or model change must state the re-index cost.
 - Prefer changes that are reversible with one environment variable or one restart.
+- Do not rewrite the whole project in one pass: propose small, reviewable changes and keep working functionality.
+- Before changing storage schemas, explain migration and re-indexing implications.
+- Add tests for each meaningful behavior and run the existing checks after changes.
+- Prefer simple local-first components and explicit interfaces over unnecessary microservices.
+- Do not add dependencies, services, or model requirements without explaining why they are needed.
+- Do not invent APIs, configuration keys, or modules; verify names and behavior in the repository.
+- Keep document and code pipelines specialized while sharing platform services.
+- Keep original files and Git authoritative; make index freshness and provenance visible to clients.
+- Treat security, file filtering, secret exclusion, scope isolation, and prompt-injection resistance as core requirements.
+- At the end of each phase, report files changed, architectural decisions, tests run, known limitations, and the next proposed phase.

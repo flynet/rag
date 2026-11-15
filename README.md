@@ -22,19 +22,26 @@ This is the state of the code in this repository, not a target design.
 | Document encoding | Plain text, no instruction |
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
 | Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
-| Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding |
+| Index backup | Qdrant snapshot create/download/restore via `scripts/qdrant_snapshot.py`; restore without re-embedding, restore-into-fresh-instance verified live |
 | Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
 | Reranking | None |
 | Hybrid / sparse search | None |
 | Chunking | Structure-aware: Markdown headings → paragraphs → sentences, 1024-character limit, 128-character overlap; `section` and character offsets in the payload |
 | Indexing | Startup reconciliation + scan, `watchdog`, signature-based incremental updates |
 | Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
-| Qdrant | `qdrant/qdrant:v1.20.1` pinned via `QDRANT_VERSION`; no snapshot schedule |
+| Qdrant | `qdrant/qdrant:v1.20.1` pinned via `QDRANT_VERSION`; storage on a named volume, snapshots dir bind-mounted; no snapshot schedule |
 | Healthchecks | Gateway, `api`, and Qdrant; `embedder` waits for Qdrant and `api` |
 | Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
 | Target hardware | One GPU, tested on RTX 4060 Laptop with 8 GB VRAM |
 
 The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
+
+**Direction:** the target is a local-first, model-agnostic knowledge and context service (Local Knowledge
+Engine): workspaces and collections for multiple products and repositories, specialized ingestion pipelines
+for documents and code, hybrid and structure-aware retrieval, context assembly with provenance, and
+access through REST, the OpenAI-compatible gateway, and MCP. Original files and Git stay authoritative; the
+index is a derived representation. Roadmap items P4-P10 in **[TODO.md](TODO.md)**; nothing in this section is
+implemented yet.
 
 ## Features
 
@@ -123,11 +130,13 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 ├── eval/
 │   ├── README.md                # dataset format and metrics
 │   └── questions.example.jsonl  # schema examples
-├── qdrant_data/                 # vector DB data (created automatically)
+├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
 └── TODO.md
 ```
+
+Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this repo. It lives on ext4 inside the Docker Desktop VM; a Windows bind mount goes through a 9p translation layer, which Qdrant reports as `"Unrecognized filesystem - cannot guarantee data safety"` and where its WAL gets corrupted. The snapshots directory is bind-mounted so snapshot files created via REST survive container recreation.
 
 ## Services
 
@@ -186,7 +195,7 @@ python scripts/qdrant_snapshot.py prune --keep 3  # delete the oldest node snaps
 python scripts/qdrant_snapshot.py delete --snapshot NAME
 ```
 
-Snapshots created via REST are stored by the node in `qdrant_data/snapshots/documents/` on the host, and `create` downloads a copy into `./backups/` so it survives a container rebuild. Keep the downloaded copy off the machine (cloud, NAS, external disk): a backup inside the folder that gets deleted with the container is not a backup.
+Snapshots created via REST are stored by the node in `/qdrant/snapshots/documents/`, bind-mounted to `qdrant_snapshots/documents/` on the host. They are not inside the storage volume, so a snapshot created without that bind mount disappears when the container is recreated. `create` downloads a copy into `./backups/` so it survives a container rebuild. Keep the downloaded copy off the machine (cloud, NAS, external disk): a backup inside the folder that gets deleted with the container is not a backup.
 
 Restore replaces the collection data, so it requires an explicit confirmation. Restoring into
 a running stack:
@@ -200,9 +209,21 @@ docker compose up -d embedder
 python scripts/smoke_test.py                      # search must return results
 ```
 
-Restoring into a fresh Qdrant instance: start only `qdrant` (an empty `qdrant_data/` is fine),
-run the same `restore` command, then check `status` shows the expected `points` and `dim`
-before starting `api` and `embedder`.
+Restoring into a fresh Qdrant instance — `docker compose down -v` removes the containers **and the
+storage volume** (this destroys the indexed data; only `./backups/` remains):
+
+```bash
+docker compose down -v                              # containers and the storage volume are removed
+docker compose up -d qdrant                         # qdrant starts with an empty volume
+python scripts/qdrant_snapshot.py status            # collection 'documents': missing
+python scripts/qdrant_snapshot.py restore --file backups/documents-....snapshot --yes
+python scripts/qdrant_snapshot.py status            # status=green, points and dim as expected
+docker compose up -d                                  # api and embedder join
+```
+
+The restore uploads the snapshot with its sha256 checksum; Qdrant creates the collection and writes
+the data onto the volume. `status` prints `points` and `dim` after restore, and `python
+scripts/smoke_test.py` checks the retrieval path end to end.
 
 The upload endpoint (`POST /collections/documents/snapshots/upload`) verifies the sha256 checksum, creates the collection if it does not exist, and overwrites everything stored on the node for that collection. The tool prints the collection state before and after (`points`, `dim`), and refuses to run without `--yes`.
 
@@ -695,15 +716,18 @@ python scripts/smoke_test.py --api-key <key>
 
 **Indexing takes long to start** — a full pass runs on an empty collection and after a model or chunking change; otherwise `embedder` skips files with a matching signature.
 
-**Vector dimension error** — the collection was created for a different model (for example, 768 for embeddinggemma while the current model produces 1024). Delete `qdrant_data/*` while the stack is stopped and restart. A normal model switch recreates the collection automatically.
+**Vector dimension error** — the collection was created for a different model (for example, 768 for embeddinggemma while the current model produces 1024). Delete the storage volume while the stack is stopped and restart. A normal model switch recreates the collection automatically.
+
+> `docker volume rm` destroys the indexed data. Take a snapshot first (`python scripts/qdrant_snapshot.py create`) and restore it afterwards if you need the index.
 
 **Qdrant crashes** — clear its data:
 
 ```powershell
-docker compose down
-Remove-Item -Path .\qdrant_data\* -Recurse -Force
+docker compose down -v            # removes the containers and the qdrant_data volume
 docker compose up -d
 ```
+
+If you want to keep the volume, remove only the container and start again; the data stays on the volume.
 
 ## Monitoring
 
