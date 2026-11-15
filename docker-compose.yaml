@@ -81,8 +81,10 @@ services:
       # indexing and chat queries queue instead of competing for VRAM.
       - EMBEDDING_MAX_CONCURRENCY=${EMBEDDING_MAX_CONCURRENCY:-1}
       # Retrieval prompt name for queries (Qwen3-Embedding: "query").
-      # Empty = encode queries without an instruction, like documents.
-      - EMBEDDING_QUERY_PROMPT=${EMBEDDING_QUERY_PROMPT:-query}
+      # Empty = encode queries without an instruction, like documents. A single
+      # dash keeps an explicitly empty value empty, so `EMBEDDING_QUERY_PROMPT=`
+      # in .env disables the prompt; `:-` would substitute the default instead.
+      - EMBEDDING_QUERY_PROMPT=${EMBEDDING_QUERY_PROMPT-query}
       # Input length limit in tokens (the model supports 32k; chunks and queries are shorter).
       - EMBEDDING_MAX_SEQ_LENGTH=${EMBEDDING_MAX_SEQ_LENGTH:-8192}
       - EMBEDDING_MODEL_NAME=rag-embeddings
@@ -129,8 +131,8 @@ services:
       - UPSTREAM_HEADERS=${UPSTREAM_HEADERS:-}
       - API_URL=http://api:8000
       - ENABLE_RAG=${ENABLE_RAG:-true}
-      - RAG_TOP_K=${RAG_TOP_K:-3}
-      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.5}
+      - RAG_TOP_K=${RAG_TOP_K:-8}
+      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.3}
       # off | concat | llm - rewrite follow-up questions before retrieval
       - RAG_QUERY_REWRITE=${RAG_QUERY_REWRITE:-off}
       - RAG_REWRITE_HISTORY=${RAG_REWRITE_HISTORY:-3}
