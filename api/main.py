@@ -41,17 +41,31 @@ except ImportError as exc:  # pragma: no cover
 
         # Fallback для локальных тестов без GPU/модели.
         class Embedder:
-            def __init__(self, model_path, device="cpu", dtype=None, batch_size=32, normalize=True, max_seq_length=None):
-                self.dim = 768
+            def __init__(
+                self,
+                model_path,
+                device="cpu",
+                dtype=None,
+                batch_size=32,
+                normalize=True,
+                max_seq_length=None,
+                query_prompt=None,
+            ):
+                # Qwen3-Embedding-0.6B produces 1024-dimensional vectors
+                self.dim = 1024
+                self.query_prompt = query_prompt
                 log.warning("Dummy embedder initialized (dim=%d)", self.dim)
 
-            async def embed(self, texts: List[str]):
+            async def embed(self, texts: List[str], prompt_name=None):
                 return np.random.randn(len(texts), self.dim).astype(np.float32)
+
+            async def embed_query(self, texts: List[str]):
+                return await self.embed(texts)
     else:
         raise
 
 # Настройки
-MODEL_PATH = os.environ.get("MODEL_PATH", "google/embeddinggemma-300m")
+MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-Embedding-0.6B")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "documents")
@@ -63,7 +77,10 @@ EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "cuda")
 EMBEDDING_DTYPE = os.environ.get("EMBEDDING_DTYPE", "float16")
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "32"))
 EMBEDDING_NORMALIZE = os.environ.get("EMBEDDING_NORMALIZE", "true").lower() in {"1", "true", "yes"}
-EMBEDDING_MAX_SEQ_LENGTH = int(os.environ.get("EMBEDDING_MAX_SEQ_LENGTH", "0")) or None
+EMBEDDING_MAX_SEQ_LENGTH = int(os.environ.get("EMBEDDING_MAX_SEQ_LENGTH", "8192")) or None
+# Имя промпта для запросов: у Qwen3-Embedding это "query" с retrieval-инструкцией.
+# Пустое значение - кодировать запросы так же, как документы.
+EMBEDDING_QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", "query").strip() or None
 
 # Глобальные объекты (инициализируются при старте)
 embedder = None
@@ -85,6 +102,7 @@ async def lifespan(_: FastAPI):
         batch_size=EMBEDDING_BATCH_SIZE,
         normalize=EMBEDDING_NORMALIZE,
         max_seq_length=EMBEDDING_MAX_SEQ_LENGTH,
+        query_prompt=EMBEDDING_QUERY_PROMPT,
     )
 
     log.info("Startup complete")
@@ -134,10 +152,14 @@ def _query(vector: List[float], limit: int, min_score: Optional[float]):
 # --------------------------------------------------------------------------- #
 
 
-async def _encode(texts: List[str]) -> np.ndarray:
+async def _encode(texts: List[str], query: bool = False) -> np.ndarray:
     if embedder is None:
         raise HTTPException(status_code=503, detail="Embedding model is not loaded yet")
-    return np.asarray(await embedder.embed(texts), dtype=np.float32)
+    if query:
+        vectors = await embedder.embed_query(texts)
+    else:
+        vectors = await embedder.embed(texts)
+    return np.asarray(vectors, dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -164,8 +186,9 @@ async def search(request: SearchRequest):
     if not _collection_exists():
         return []
 
-    # 1. Получаем embedding для запроса
-    query_vectors = await _encode([request.query])
+    # 1. Получаем embedding для запроса: с retrieval-инструкцией модели
+    #    (у Qwen3-Embedding - prompt_name="query").
+    query_vectors = await _encode([request.query], query=True)
     query_vector = query_vectors[0].astype(float).tolist()
 
     # 2. Ищем в Qdrant
@@ -313,6 +336,7 @@ async def health():
         "device": EMBEDDING_DEVICE,
         "dtype": EMBEDDING_DTYPE,
         "dim": getattr(embedder, "dim", None),
+        "query_prompt": getattr(embedder, "query_prompt", EMBEDDING_QUERY_PROMPT),
         "collection": COLLECTION_NAME,
         "collection_exists": collection_exists,
     }

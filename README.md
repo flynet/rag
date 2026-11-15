@@ -1,184 +1,229 @@
-# RAG Gateway — OpenAI-совместимый API с RAG
+# RAG Gateway — OpenAI-compatible API with retrieval
 
-Локальная RAG-система на базе Docker: автоматическая индексация документов, семантический поиск и **OpenAI-совместимый API** для агентов.
+A local RAG stack for documents: automatic indexing, semantic search over Qdrant, and an OpenAI-compatible gateway for agents.
 
-Модель генерации в стек не входит: шлюз ходит к **внешнему OpenAI-совместимому серверу** (vLLM, LM Studio, llama.cpp, облако), а агенты — только к шлюзу. Ключ модельного сервера остаётся внутри шлюза.
+The generation model is **not** part of this stack. The gateway forwards chat requests to an external OpenAI-compatible server (vLLM, LM Studio, llama.cpp, a cloud endpoint); agents only talk to the gateway, and the upstream key never leaves it.
 
-Веб-интерфейса для чата больше нет (Open WebUI удалён) — сервис предоставляет только API. Любой агент или клиент, умеющий работать с OpenAI API, может использовать его, указав `base_url`.
-
-```
+```text
 OPENAI_BASE_URL=http://localhost:8001/v1
-OPENAI_API_KEY=<ваш ключ из API_KEYS>
+OPENAI_API_KEY=<key from API_KEYS>
 ```
 
-## 🚀 Возможности
+There is no chat UI — the service exposes an API only. Any OpenAI-compatible client (OpenAI SDK, LangChain, Continue, Cline, etc.) can use it.
 
-- ✅ **OpenAI-compatible API**: `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/embeddings`
-- ✅ **Автоматическая индексация** документов с мониторингом изменений
-- ✅ **RAG по умолчанию**: контекст из базы знаний подмешивается в каждый запрос
-- ✅ **Прозрачный passthrough**: `tools`, `tool_calls`, `response_format`, `temperature` и любые другие поля OpenAI уходят в LLM без изменений
-- ✅ **Bearer-аутентификация** по статическим ключам
-- ✅ **Ключ апстрима не покидает шлюз**: агент видит только свой ключ, `Authorization` наружу не пробрасывается
-- ✅ **Управление RAG на уровне запроса** через заголовки
-- ✅ **Один экземпляр embedding-модели** (fp16 на GPU): индексатор работает без torch и CUDA
-- ✅ **Инкрементальная индексация**: неизменившиеся файлы не пересчитываются
-- ✅ **Qdrant** векторная база данных
+## Current state
 
-## 📁 Структура проекта
+This is the state of the code in this repository, not a target design.
 
-```
-.
-├── docker-compose.yaml          # Оркестрация всех сервисов
-├── .env.example                 # Шаблон переменных окружения
-├── data/
-│   └── documents/               # 📂 Сюда помещайте документы для индексации
-├── models/
-│   └── hf-cache/                # 🤖 HF-кэш embedding-модели (создаётся автоматически)
-├── embedder/                    # 📝 Индексатор: watchdog + HTTP-клиент (без torch)
-│   ├── Dockerfile
-│   ├── main.py                  # Watcher + worker, инкрементальная индексация
-│   ├── embedder.py              # HTTP-клиент к api
-│   ├── vector_db.py             # Qdrant client wrapper
-│   └── requirements.txt
-├── api/                         # 🔍 Эмбеддинги + поиск (единственный владелец модели)
-│   ├── Dockerfile
-│   ├── main.py                  # /search, /embed, /v1/embeddings
-│   ├── embedder.py              # SentenceTransformer (fp16)
-│   └── requirements.txt
-├── gateway/                     # 🌐 Публичный OpenAI-совместимый шлюз
-│   ├── Dockerfile
-│   ├── main.py                  # /v1/chat/completions + инжекция RAG
-│   └── requirements.txt
-├── scripts/
-│   └── smoke_test.py            # Проверка API после запуска
-├── qdrant_data/                 # 💾 Векторная БД (создается автоматически)
-```
+| Area | Current implementation |
+|---|---|
+| Embedding model | `Qwen/Qwen3-Embedding-0.6B`, 1024 dimensions, fp16 on GPU |
+| Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
+| Document encoding | Plain text, no instruction |
+| Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
+| Reranking | None |
+| Hybrid / sparse search | None |
+| Chunking | Fixed 1024 characters with 128-character overlap |
+| Indexing | Startup scan + `watchdog`; signature-based incremental updates |
+| Deletion handling | Live watcher events; vectors of files deleted while the stack was down are **not** removed (see [TODO.md](TODO.md)) |
+| Qdrant | `qdrant/qdrant:latest`, no snapshot schedule |
+| Healthchecks | Gateway only; `api` and Qdrant have none |
+| Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
+| Target hardware | One GPU, tested on RTX 4060 Laptop with 8 GB VRAM |
 
-## 🏗️ Архитектура
+The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 
-```
+## Features
+
+- OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/v1/embeddings`
+- Automatic document indexing with file-change monitoring
+- RAG enabled by default: retrieved chunks are injected into the current user turn
+- Transparent passthrough of `tools`, `tool_calls`, `response_format`, `temperature`, and other OpenAI fields
+- Bearer authentication with static keys
+- The upstream key stays in the gateway; the agent's `Authorization` header is never forwarded
+- Per-request RAG control via `X-RAG-*` headers
+- A single embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
+- Incremental indexing: unchanged files are skipped based on a stored signature
+- Qdrant vector database
+
+## Architecture
+
+```text
 ┌──────────────┐
-│ Агент / LLM  │  (OpenAI SDK, LangChain, Continue, Cline, ...)
-│   клиент     │
+│ Agent / LLM  │  OpenAI SDK, LangChain, Continue, Cline, ...
+│   client     │
 └──────┬───────┘
-       │  OpenAI API: POST /v1/chat/completions
+       │  POST /v1/chat/completions
        v
 ┌─────────────────────────┐
-│  Gateway      :8001     │  ← единственная публичная точка входа
-│  • Bearer auth агента   │
-│  • retrieval в API      │
-│  • контекст в последнее │
-│    user-сообщение       │
-│  • подмена Authorization│
+│ Gateway      :8001      │  single public entry point
+│ • agent bearer auth     │
+│ • retrieval via api     │
+│ • context injection     │
+│ • upstream auth swap    │
 └────┬───────────────┬────┘
      │               │
      v               v
-┌──────────────────────┐     ┌───────────────────┐
-│ LLM-сервер (LAN)     │     │ API       :8000   │
-│ vLLM / LM Studio /   │     │ 1× embedding      │
-│ llama.cpp :8000/v1   │     │ модель (fp16)     │
-└──────────────────────┘     └────┬─────────┬────┘
-                                  │         ▲
-                                  v         │ POST /embed
-                            ┌──────────┐    │
-                            │  Qdrant  │    │
-                            │  :6333   │    │
-                            └────▲─────┘    │
-                                 │          │
-                            ┌────┴──────────┴┐
-                            │  Embedder      │
-                            │  (watchdog)    │
-                            └────────┬───────┘
-                                     v
-                             data/documents/
+┌──────────────────┐   ┌───────────────────┐
+│ LLM server (LAN) │   │ API       :8000   │
+│ vLLM / LM Studio │   │ 1× embedding      │
+│ llama.cpp / cloud│   │ model (fp16)      │
+└──────────────────┘   └────┬─────────┬────┘
+                            │         ▲
+                            v         │ POST /embed
+                      ┌──────────┐    │
+                      │  Qdrant  │    │
+                      │  :6333   │    │
+                      └────▲─────┘    │
+                           │          │
+                      ┌────┴──────────┴┐
+                      │  Embedder      │
+                      │  (watchdog)    │
+                      └────────┬───────┘
+                               v
+                       data/documents/
 ```
 
-## 🐳 Сервисы Docker
+## Project structure
 
-### 1. **Gateway** — публичный OpenAI-совместимый API
-- **Порт**: `8001` → `http://localhost:8001/v1`
-- **Назначение**: единственная точка входа для агентов
-- **Функции**:
-  - проверка `Authorization: Bearer <key>` (ключ агента)
-  - retrieval по последнему user-сообщению
-  - инжекция найденных документов в текст последнего user-сообщения
-  - проксирование в OpenAI-совместимый апстрим с полным passthrough тела запроса
-  - собственная авторизация у апстрима (`UPSTREAM_API_KEY`); ключ агента наружу не уходит
-  - `401/403` апстрима превращаются в `502 upstream_auth_failed`
-  - SSE-стриминг без буферизации
-- **Swagger**: http://localhost:8001/docs
+```text
+.
+├── docker-compose.yaml          # service orchestration
+├── .env.example                 # environment template
+├── data/
+│   └── documents/               # put documents here for indexing
+├── models/
+│   └── hf-cache/                # Hugging Face cache (created automatically)
+├── embedder/                    # indexer: watchdog + HTTP client (no torch)
+│   ├── Dockerfile
+│   ├── main.py                  # watcher, worker, incremental indexing
+│   ├── embedder.py              # HTTP client for api
+│   ├── vector_db.py             # Qdrant client wrapper
+│   └── requirements.txt
+├── api/                         # embeddings + search (owns the model)
+│   ├── Dockerfile
+│   ├── main.py                  # /search, /embed, /v1/embeddings
+│   ├── embedder.py              # SentenceTransformer wrapper
+│   └── requirements.txt
+├── gateway/                     # public OpenAI-compatible gateway
+│   ├── Dockerfile
+│   ├── main.py                  # /v1/chat/completions + RAG injection
+│   └── requirements.txt
+├── scripts/
+│   ├── smoke_test.py            # end-to-end API check
+│   └── ...
+├── qdrant_data/                 # vector DB data (created automatically)
+├── README.md
+└── TODO.md
+```
 
-### 2. **API** — эмбеддинги и поиск (единственный владелец модели)
-- **Порт**: `8000` (только для отладки)
-- **Endpoints**:
-  - `POST /search` — семантический поиск (используется шлюзом)
-  - `POST /embed` — внутренний батч-эндпоинт для индексатора
-  - `POST /v1/embeddings` — OpenAI-совместимые эмбеддинги
-  - `GET /collection/info` — статистика коллекции
-  - `GET /collection/sample` — примеры документов
-  - `GET /health` — проверка состояния, устройство и размерность
-- **Модель**: загружается здесь и только здесь, `fp16` на GPU
-- **Swagger**: http://localhost:8000/docs
+## Services
 
-### 3. **Embedder** — индексация
-- **Назначение**: автоматическая индексация документов
-- **Функции**:
-  - мониторит `./data/documents` (polling каждую секунду)
-  - режет текст на чанки
-  - запрашивает векторы у `api` (`POST /embed`) и пишет их в Qdrant
-  - переиндексирует только изменившиеся файлы (`mtime` + размер + конфиг чанков + модель)
-- **GPU**: не требуется — образ `python:3.10-slim` без torch/CUDA, ~150 МБ RAM
+### Gateway — public OpenAI-compatible API
 
-### 4. **LLM-сервер** — внешний OpenAI-совместимый апстрим
-- **Где**: другая машина в сети (или облако), в этот стек не входит
-- **Что подходит**: vLLM, LM Studio, llama.cpp server, TGI, облачный OpenAI API
-- **Как подключить**: `UPSTREAM_BASE_URL` в `.env` (с `/v1` на конце или без)
-- **Авторизация**: `UPSTREAM_API_KEY` (пусто — заголовок не отправляется, как у LM Studio/llama.cpp)
-- **Модели**: шлюз отдаёт список из `GET /v1/models` апстрима как есть
+- **Port:** `8001` → `http://localhost:8001/v1`
+- **Purpose:** the only entry point for agents
+- **Behavior:**
+  - validates `Authorization: Bearer <key>` against `API_KEYS`
+  - retrieves context for the last user message
+  - injects retrieved documents into the text of that user message
+  - forwards the request to the upstream OpenAI-compatible server with full body passthrough
+  - authenticates to the upstream with `UPSTREAM_API_KEY`; the agent's key is never sent upstream
+  - maps upstream `401/403` to `502 upstream_auth_failed`
+  - streams SSE without buffering
+- **Swagger:** http://localhost:8001/docs
 
-### 5. **Qdrant** — векторная БД
-- **Порт**: `6333`
-- **Dashboard**: http://localhost:6333/dashboard
+### API — embeddings and search
 
-## 🚀 Быстрый старт
+- **Port:** `8000` (debug only; agents use the gateway)
+- **Endpoints:**
+  - `POST /search` — semantic search (used by the gateway)
+  - `POST /embed` — internal batch endpoint for the indexer
+  - `POST /v1/embeddings` — OpenAI-compatible embeddings
+  - `GET /collection/info` — collection statistics
+  - `GET /collection/sample` — sample points
+  - `GET /health` — model, device, dimension, and collection status
+- **Model:** loaded here and only here, fp16 on GPU
+- **Swagger:** http://localhost:8000/docs
 
-### Предварительные требования
+### Embedder — indexing
 
-1. **Docker и Docker Compose**
-2. **NVIDIA GPU** с CUDA 12.4+ и **NVIDIA Container Toolkit** (только для embeddings)
-3. **OpenAI-совместимый сервер с LLM**, доступный по сети (vLLM / LM Studio / llama.cpp) — модель эмбеддингов скачается автоматически из HuggingFace в `./models/hf-cache` при первом запуске
+- Watches `./data/documents` (polling every second)
+- Splits text into chunks
+- Requests vectors from `api` (`POST /embed`) and writes them to Qdrant
+- Re-indexes only files whose signature changed (`mtime`, size, chunking config, model)
+- **GPU:** not required; the image is based on `python:3.10-slim` and has no torch/CUDA
 
-### Установка
+### Qdrant — vector database
 
-**1. Создайте конфиг и задайте ключ:**
+- **Port:** `6333`
+- **Dashboard:** http://localhost:6333/dashboard
+
+### LLM server — external upstream
+
+- Not part of this stack; usually another machine or a cloud endpoint
+- Any OpenAI-compatible server: vLLM, LM Studio, llama.cpp server, TGI, OpenAI
+- Configure with `UPSTREAM_BASE_URL` (with or without the trailing `/v1`)
+- Put its key in `UPSTREAM_API_KEY`; leave empty if the server has no auth
+
+## Quick start
+
+### Prerequisites
+
+1. Docker with the Compose plugin
+2. NVIDIA GPU with CUDA 12.4+ and the NVIDIA Container Toolkit (for embeddings), or CPU only
+3. An OpenAI-compatible LLM server reachable over the network
+
+The embedding model (~1.2 GB) is downloaded from Hugging Face into `./models/hf-cache` on first start.
+
+### Setup
+
+**1. Create the environment file:**
+
+```bash
+cp .env.example .env
+```
+
+On PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
-# откройте .env и впишите API_KEYS=sk-local-change-me
-# и UPSTREAM_BASE_URL=http://192.168.1.50:8000/v1
 ```
 
-**2. Запустите сервисы:**
+Edit `.env` and set at least:
+
+```env
+API_KEYS=sk-local-change-me
+UPSTREAM_BASE_URL=http://192.168.1.50:8000/v1
+```
+
+**2. Build and start:**
 
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
-**3. Убедитесь, что шлюз видит модель:**
+The API service must download and load Qwen3-Embedding-0.6B before it can serve. The indexer waits for it for up to 10 minutes; watch the progress with:
+
+```bash
+docker compose logs -f api embedder
+```
+
+**3. Check the gateway:**
 
 ```bash
 curl http://localhost:8001/v1/models -H "Authorization: Bearer sk-local-change-me"
 ```
 
-Если список пуст или приходит `502`, проверьте `UPSTREAM_BASE_URL` — это адрес вашего LLM-сервера, а не gateway.
+An empty list or `502` means `UPSTREAM_BASE_URL` is wrong — it must point to your LLM server, not to the gateway.
 
-**4. Проверьте API:**
+**4. Run the smoke test:**
 
 ```bash
 python scripts/smoke_test.py --api-key sk-local-change-me
 ```
 
-**5. Используйте из агента:**
+**5. Use it from an agent:**
 
 ```python
 from openai import OpenAI
@@ -186,45 +231,42 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8001/v1", api_key="sk-local-change-me")
 
 response = client.chat.completions.create(
-    model="qwen2.5-7b-instruct",   # id из GET /v1/models
-    messages=[{"role": "user", "content": "Кто такой Пупкин?"}],
+    model="qwen2.5-7b-instruct",   # an id returned by GET /v1/models
+    messages=[{"role": "user", "content": "Who is Pupkin?"}],
 )
 print(response.choices[0].message.content)
 ```
 
-> Если обновляетесь с версии с Open WebUI: `docker-compose rm -sf open-webui` и удалите папку `webui_data/`.
-> Если обновляетесь с версии с Ollama: удалите папку `ollama_data/` — сервис больше не используется.
+## Authentication
 
-## 🔑 Аутентификация
-
-Ключи задаются списком в `.env`:
+Keys are configured as a comma-separated list:
 
 ```env
 API_KEYS=sk-local-change-me,sk-agent-2
 ```
 
-- Проверяется заголовок `Authorization: Bearer <key>`.
-- Сравнение — constant-time (`secrets.compare_digest`).
-- Если `API_KEYS` пустой, аутентификация **отключена** (только для localhost).
-- Ошибка возвращается в формате OpenAI:
+- The gateway checks `Authorization: Bearer <key>`.
+- Comparison is constant-time (`secrets.compare_digest`).
+- An empty `API_KEYS` disables authentication (local development only).
+- Errors use the OpenAI error envelope:
 
 ```json
 {"error": {"message": "Invalid or missing API key...", "type": "invalid_request_error", "param": null, "code": null}}
 ```
 
-### Ключ модели
+### Upstream key
 
-`UPSTREAM_API_KEY` — это ключ **модельного сервера**, а не клиента. Он живёт только в контейнере `gateway`:
+`UPSTREAM_API_KEY` is the **model server's** key, not the agent's. It lives only in the gateway container:
 
-- входящий `Authorization` агента никогда не пересылается на апстрим;
-- если ключ апстрима пуст, заголовок `Authorization` не отправляется вовсе;
-- если апстрим всё же ответил `401/403`, агент получает `502 upstream_auth_failed`, а не `401` — иначе он решил бы, что неверен его собственный ключ.
+- the agent's incoming `Authorization` header is never forwarded;
+- if the upstream key is empty, no `Authorization` header is sent at all;
+- if the upstream still returns `401/403`, the agent gets `502 upstream_auth_failed`, not `401` — otherwise it would assume its own key is wrong.
 
-## 📖 API
+## API
 
 ### `GET /v1/models`
 
-Прозрачное проксирование списка моделей апстрима.
+Transparent proxy of the upstream model list.
 
 ```bash
 curl http://localhost:8001/v1/models -H "Authorization: Bearer sk-local-change-me"
@@ -241,7 +283,7 @@ curl http://localhost:8001/v1/models -H "Authorization: Bearer sk-local-change-m
 
 ### `POST /v1/chat/completions`
 
-Основной эндпоинт. Тело запроса — стандартный OpenAI Chat Completions, включая `tools`, `tool_choice`, `response_format`, `temperature`, `stream`, `stream_options`.
+The main endpoint. The request body is standard OpenAI Chat Completions, including `tools`, `tool_choice`, `response_format`, `temperature`, `stream`, and `stream_options`.
 
 ```bash
 curl -X POST http://localhost:8001/v1/chat/completions \
@@ -249,46 +291,46 @@ curl -X POST http://localhost:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-7b-instruct",
-    "messages": [{"role": "user", "content": "Кто такой Пупкин?"}],
+    "messages": [{"role": "user", "content": "Who is Pupkin?"}],
     "stream": false
   }'
 ```
 
-**Стриминг** — обычный OpenAI SSE (`data: {...}` … `data: [DONE]`):
+**Streaming** uses the standard OpenAI SSE format (`data: {...}` … `data: [DONE]`):
 
 ```python
 stream = client.chat.completions.create(
     model="qwen2.5-7b-instruct",
-    messages=[{"role": "user", "content": "Кто такой Пупкин?"}],
+    messages=[{"role": "user", "content": "Who is Pupkin?"}],
     stream=True,
 )
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-#### Управление RAG через заголовки
+#### Per-request RAG control
 
-| Заголовок | Значение | Действие |
+| Header | Value | Effect |
 |---|---|---|
-| `X-RAG` | `on` / `off` | включить/выключить retrieval для запроса |
-| `X-RAG-TOP-K` | `1..20` | сколько чанков подмешать |
-| `X-RAG-MIN-SCORE` | `0.0..1.0` | минимальный cosine score |
+| `X-RAG` | `on` / `off` | enable or disable retrieval for the request |
+| `X-RAG-TOP-K` | `1..20` | number of chunks to inject |
+| `X-RAG-MIN-SCORE` | `-1.0..1.0` | minimum cosine score |
 
 ```bash
-# ответить без базы знаний
+# answer without the knowledge base
 curl ... -H "X-RAG: off" ...
 ```
 
-#### Источники в ответе
+#### Sources in the response
 
-Схема ответа остаётся строго OpenAI-совместимой, поэтому найденные документы отдаются в заголовках:
+The response body stays strictly OpenAI-compatible, so retrieved sources are returned in headers:
 
-| Заголовок | Значение |
+| Header | Value |
 |---|---|
-| `X-RAG-Hits` | количество подмешанных чанков |
-| `X-RAG-Sources` | `base64url(JSON)` без паддинга: `[{"file","chunk","score"}]` |
+| `X-RAG-Hits` | number of injected chunks |
+| `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score"}]` |
 
-Декодирование:
+Decoding:
 
 ```python
 import base64, json
@@ -296,34 +338,34 @@ raw = response.headers["X-RAG-Sources"]
 sources = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
 ```
 
-В OpenAI SDK заголовки доступны через `response.with_raw_response`:
+With the OpenAI SDK, headers are available via `with_raw_response`:
 
 ```python
 raw = client.chat.completions.with_raw_response.create(
     model="qwen2.5-7b-instruct",
-    messages=[{"role": "user", "content": "Кто такой Пупкин?"}],
+    messages=[{"role": "user", "content": "Who is Pupkin?"}],
 )
 print(raw.headers.get("X-RAG-Hits"))
 print(raw.parse())
 ```
 
-#### Когда retrieval не выполняется
+#### When retrieval is skipped
 
-Контекст подмешивается только для «свежего» user-сообщения — то есть когда последнее сообщение в `messages` имеет `role: "user"`. Внутри агентского tool-loop (последнее сообщение — `tool` или `assistant` с `tool_calls`) retrieval пропускается, чтобы не раздувать промпт на каждом шаге.
+Context is injected only for a "fresh" user turn — when the last message in `messages` has `role: "user"`. Inside an agent tool loop (the last message is `tool`, or an `assistant` message with `tool_calls`), retrieval is skipped to avoid bloating every step with the same documents.
 
-Если сервис `api` недоступен, шлюз **не ломает** чат: запрос уходит в LLM без контекста, в логе остаётся `WARNING`.
+If the `api` service is unavailable, the gateway does **not** break chat: the request goes to the LLM without context and a `WARNING` is logged.
 
-**Куда именно попадает контекст.** Блок `<knowledge_base>` дописывается в начало `content` последнего user-сообщения, а сам вопрос остаётся в конце. Отдельное `system`-сообщение не добавляется: префикс `system + история` не меняется, поэтому prompt caching апстрима продолжает работать, а chat-шаблоны (ChatML, Llama 3), которые требуют `system` только первым сообщением, не ломаются.
+**Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
 ### `POST /v1/embeddings`
 
-OpenAI-совместимые эмбеддинги на той же локальной модели.
+OpenAI-compatible embeddings from the same local model.
 
 ```bash
 curl -X POST http://localhost:8001/v1/embeddings \
   -H "Authorization: Bearer sk-local-change-me" \
   -H "Content-Type: application/json" \
-  -d '{"input": ["первый текст", "второй текст"]}'
+  -d '{"input": ["first text", "second text"]}'
 ```
 
 ```json
@@ -335,13 +377,14 @@ curl -X POST http://localhost:8001/v1/embeddings \
 }
 ```
 
-- `input`: строка или массив строк (массивы токенов не поддерживаются).
-- `encoding_format`: `float` (по умолчанию) или `base64`.
-- `usage` — приблизительная оценка (~4 символа на токен).
+- `input`: a string or an array of strings (token arrays are not supported)
+- `encoding_format`: `float` (default) or `base64`
+- `usage` is an estimate (~4 characters per token)
+- texts are encoded **as documents** (no retrieval instruction); use `/search` for query-style retrieval
 
 ### `GET /health`
 
-Публичный, без аутентификации. Проверяет доступность модельного сервера и `api`.
+Public, no authentication. Checks the model server and the `api` service.
 
 ```json
 {
@@ -356,245 +399,291 @@ curl -X POST http://localhost:8001/v1/embeddings \
 }
 ```
 
-`status` = `degraded`, если хотя бы одна зависимость недоступна. Если `UPSTREAM_BASE_URL` пуст, в логе будет `CRITICAL`, `upstream` — `ok: false`, а чат-запросы вернут `503` вместо падения контейнера.
+`status` is `degraded` when at least one dependency is unavailable. If `UPSTREAM_BASE_URL` is empty, the gateway logs `CRITICAL`, reports `upstream.ok: false`, and returns `503` for chat requests instead of crashing.
 
-## ⚙️ Конфигурация
+## Configuration
 
-Переменные читаются из `.env` (см. `.env.example`).
+Variables are read from `.env` (see [`.env.example`](.env.example)).
 
-| Переменная | По умолчанию | Описание |
+### User-facing variables
+
+| Variable | Default | Description |
 |---|---|---|
-| `API_KEYS` | — | список Bearer-ключей через запятую; пусто = без auth |
-| `EMBEDDING_MODEL` | `google/embeddinggemma-300m` | модель эмбеддингов (одна на всю систему) |
-| `EMBEDDING_DEVICE` | `cuda` | `cuda` или `cpu` |
-| `EMBEDDING_DTYPE` | `float16` | `float16`, `bfloat16`, `float32`, `auto`; на CPU всегда fp32 |
-| `EMBED_BATCH_SIZE` | `32` | текстов на один запрос эмбеддинга |
-| `ENABLE_RAG` | `true` | глобальный выключатель RAG |
-| `RAG_TOP_K` | `3` | чанков в контексте по умолчанию |
-| `RAG_MIN_SCORE` | `0.5` | порог релевантности по умолчанию |
-| `UPSTREAM_BASE_URL` | — | адрес OpenAI-совместимого сервера (`.../v1` или без) |
-| `UPSTREAM_API_KEY` | — | ключ модельного сервера; пусто = без заголовка |
-| `UPSTREAM_HEADERS` | — | доп. заголовки апстрима JSON-объектом |
-| `UPSTREAM_TIMEOUT` | `600` | таймаут генерации, сек (включая стрим) |
-| `LOG_LEVEL` | `INFO` | уровень логов |
+| `API_KEYS` | — | comma-separated bearer keys; empty disables auth |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | embedding model (one per deployment) |
+| `EMBEDDING_DEVICE` | `cuda` | `cuda` or `cpu` |
+| `EMBEDDING_DTYPE` | `float16` | `float16`, `bfloat16`, `float32`, `auto`; CPU always uses fp32 |
+| `EMBEDDING_QUERY_PROMPT` | `query` | model prompt used for queries; empty = encode queries like documents |
+| `EMBEDDING_MAX_SEQ_LENGTH` | `8192` | maximum tokens per text (the model supports 32k) |
+| `EMBED_BATCH_SIZE` | `32` | texts per embedding request (both indexing and API batching) |
+| `ENABLE_RAG` | `true` | global RAG switch |
+| `RAG_TOP_K` | `3` | default number of chunks in the context |
+| `RAG_MIN_SCORE` | `0.5` | default cosine-score threshold |
+| `UPSTREAM_BASE_URL` | — | OpenAI-compatible server URL (`.../v1` or without) |
+| `UPSTREAM_API_KEY` | — | model-server key; empty = no header |
+| `UPSTREAM_HEADERS` | — | extra upstream headers as a JSON object |
+| `UPSTREAM_TIMEOUT` | `600` | generation timeout in seconds, including streaming |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` |
 
-Остальные настройки `api` и `embedder` задаются прямо в `docker-compose.yaml`: `QDRANT_HOST`, `COLLECTION_NAME`, `CHUNK_SIZE`, `CHUNK_OVERLAP`, `DEBOUNCE_SEC`.
+### Gateway variables
 
-## 🧠 Память и производительность
+These are set in `docker-compose.yaml` and normally do not need to be changed:
 
-Раскладка рассчитана на одну машину с одной GPU (проверялось на RTX 4060 Laptop, 8 ГБ VRAM).
-
-Раньше модель эмбеддингов загружалась дважды — в `embedder` и в `api`: два экземпляра весов, два torch-рантайма и два CUDA-контекста на одной карте. Теперь веса грузит только `api`, а `embedder` ходит к нему по HTTP и вообще не содержит torch.
-
-| Компонент | Раньше | Сейчас |
+| Variable | Default | Description |
 |---|---|---|
-| `embedder`: torch + CUDA | ~1.5 ГБ | — |
-| `embedder`: веса модели | gemma-2-2b fp32 ≈ 10.4 ГБ | — |
-| `api`: torch + CUDA | ~1.5 ГБ | ~1.5 ГБ |
-| `api`: веса модели | 10.4 ГБ | embeddinggemma-300m fp16 ≈ 0.6 ГБ |
-| `qdrant` | ~0.2 ГБ | ~0.2 ГБ |
-| **Итого** | **≈ 26 ГБ** | **≈ 5 ГБ** |
+| `API_URL` | `http://api:8000` | internal embedding/search service URL |
+| `RAG_MAX_TOP_K` | `20` | hard cap for `top_k` and `X-RAG-TOP-K` |
+| `RAG_TIMEOUT` | `30` | timeout for the retrieval call |
+| `CONNECT_TIMEOUT` | `10` | timeout for upstream connection probes |
+| `MAX_REQUEST_BYTES` | `8000000` | maximum accepted request-body size |
 
-Сама LLM теперь живёт на другом хосте, поэтому локальная GPU целиком занята эмбеддингами и больше не конкурирует с моделью генерации.
+### API variables
 
-Что ещё сделано:
+Set in `docker-compose.yaml`:
 
-- **fp16 вместо fp32** — вдвое меньше весов и быстрее на тензорных ядрах. На CPU точность принудительно понижается до fp32: `fp16` там медленный и поддержан не всеми операми.
-- **Нормализация векторов** (`EMBEDDING_NORMALIZE`, по умолчанию `true`) — стабильнее cosine-поиск.
-- **Инкрементальная индексация** — в payload каждого чанка лежит подпись файла (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `model`). При рестарте и по событиям watcher неизменившиеся файлы пропускаются.
-- **Батчи** — тексты уходят в `api` порциями по `EMBED_BATCH_SIZE`, а не всем файлом сразу.
-- **Лимиты памяти** — `mem_limit` у `embedder` (1 ГБ) и `gateway` (512 МБ), чтобы runaway-индексация не съела хост.
-- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — меньше фрагментации VRAM.
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PATH` | `${EMBEDDING_MODEL}` | model id or local path |
+| `HF_HOME` | `/models/hf-cache` | Hugging Face cache inside the container |
+| `EMBEDDING_BATCH_SIZE` | `${EMBED_BATCH_SIZE}` | texts per forward pass |
+| `EMBEDDING_NORMALIZE` | `true` | L2-normalize output vectors |
+| `EMBEDDING_MODEL_NAME` | `rag-embeddings` | `model` field returned by `/v1/embeddings` |
+| `MAX_BATCH_SIZE` | `256` | maximum texts per API request |
+| `QDRANT_HOST` / `QDRANT_PORT` | `qdrant` / `6333` | Qdrant location |
+| `COLLECTION_NAME` | `documents` | Qdrant collection |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | reduces VRAM fragmentation |
 
-Если нужно освободить GPU полностью, переведите эмбеддинги на CPU:
+### Embedder variables
+
+Set in `docker-compose.yaml`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_URL` | `http://api:8000` | embedding service URL |
+| `WATCH_PATH` | `/data/documents` | directory to watch |
+| `DEBOUNCE_SEC` | `1.0` | file-event debounce |
+| `CHUNK_SIZE` | `1024` | chunk size in characters |
+| `CHUNK_OVERLAP` | `128` | overlap in characters |
+| `EMBED_BATCH_SIZE` | `32` | texts per `/embed` request |
+| `EMBEDDING_MODEL` | `unknown` (set by Compose) | model label stored in each chunk's signature |
+
+## Embedding model
+
+The stack currently uses **`Qwen/Qwen3-Embedding-0.6B`**:
+
+- 0.6B parameters, 1024-dimensional embeddings (MRL: 32–1024), 32k context
+- multilingual (100+ languages)
+- instruction-aware: queries can be prefixed with a retrieval instruction
+
+Qwen3-Embedding expects the instruction on the **query** side only:
+
+```text
+Instruct: Given a web search query, retrieve relevant passages that answer the query
+Query: <user query>
+```
+
+The instruction comes from the model's own `query` prompt and is applied by `api/embedder.py` through `prompt_name="query"`. Set `EMBEDDING_QUERY_PROMPT` to change the prompt name, or empty to disable it. According to the model card, the query-side instruction improves retrieval by roughly 1–5%.
+
+Documents are encoded without an instruction. `/embed` and `/v1/embeddings` encode text as documents; `/search` encodes the query with the instruction.
+
+### Changing the model
+
+The model is configured by one variable, read by both services (`api` loads the weights; `embedder` uses it as an index-invalidation label):
+
+```env
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+```
+
+| Model | Dim | fp16 weights | Notes |
+|---|---|---|---|
+| `Qwen/Qwen3-Embedding-0.6B` | 1024 | ≈ 1.2 GB | default: multilingual, instruction-aware |
+| `google/embeddinggemma-300m` | 768 | ≈ 0.6 GB | lighter and faster |
+| `intfloat/multilingual-e5-small` | 384 | ≈ 0.24 GB | fastest option |
+| `BAAI/bge-m3` | 1024 | ≈ 1.1 GB | strong multilingual model, no instructions |
+
+Changing the model invalidates the index because each chunk stores the model name in its payload. If the dimension changes (768 → 1024 when switching from embeddinggemma), the Qdrant collection is recreated automatically (`recreating the collection` in the log); if the dimension is the same, the collection is kept but all documents are still re-indexed. The full pass starts when `embedder` starts.
+
+Different models produce different cosine-score distributions, so re-check `RAG_MIN_SCORE` after a switch (0.5 is a reasonable starting point for Qwen3-Embedding). Use the evaluation harness from [TODO.md](TODO.md) to tune it.
+
+The model is downloaded into `./models/hf-cache` on first start and is reused across container restarts. Old weights are not deleted automatically; after switching, you can remove `models--google--embeddinggemma-300m` to free ~0.6 GB.
+
+### Dependency pins
+
+Qwen3-Embedding requires `transformers>=4.51` (Qwen3 architecture support; older versions fail with `KeyError: 'qwen3'`). `api/requirements.txt` also pins `sentence-transformers<6` because sentence-transformers 6.x requires transformers 5.x, which this stack has not been tested with.
+
+## Document indexing
+
+Put UTF-8 text files into `data/documents`:
+
+```powershell
+Copy-Item .\mydocument.txt .\data\documents\
+```
+
+The indexer:
+
+1. scans `data/documents` at startup and queues every file;
+2. watches for changes with `PollingObserver` and a 1-second debounce;
+3. skips files whose signature matches the stored one (`mtime`, size, chunk size, overlap, model);
+4. splits changed files into 1024-character chunks with 128-character overlap;
+5. deletes the file's old vectors and upserts the new ones.
+
+Logs:
+
+```bash
+docker compose logs -f embedder
+```
+
+```text
+2026-11-15 13:14:33 INFO [embedder] Stable event for /data/documents/mydocument.txt
+2026-11-15 13:14:35 INFO [embedder] Upserted 5 chunks for /data/documents/mydocument.txt
+2026-11-15 13:14:40 INFO [embedder] Unchanged, skipping /data/documents/other.txt
+```
+
+**Known limitation:** files deleted or renamed while the stack is stopped leave their vectors in Qdrant. The startup scan only adds existing files; it does not reconcile stale points. See [TODO.md](TODO.md) for the planned fix.
+
+## Memory and performance
+
+The layout targets a single machine with one GPU (tested on an RTX 4060 Laptop, 8 GB VRAM).
+
+The embedding model used to be loaded twice — in `embedder` and in `api`: two sets of weights, two torch runtimes, two CUDA contexts on one GPU. Now only `api` loads the weights; `embedder` talks to it over HTTP and contains no torch.
+
+| Component | Before | Now |
+|---|---|---|
+| `embedder`: torch + CUDA | ~1.5 GB | — |
+| `embedder`: model weights | gemma-2-2b fp32 ≈ 10.4 GB | — |
+| `api`: torch + CUDA | ~1.5 GB | ~1.5 GB |
+| `api`: model weights | 10.4 GB | Qwen3-Embedding-0.6B fp16 ≈ 1.2 GB |
+| `qdrant` | ~0.2 GB | ~0.2 GB |
+| **Total host memory** | **≈ 26 GB** | **≈ 5.6 GB** |
+
+The LLM lives on another host, so the local GPU is dedicated to embeddings.
+
+Other decisions:
+
+- **fp16 instead of fp32** — half the weights and faster on tensor cores. On CPU, precision is forced to fp32 because fp16 is slow and unsupported by many ops.
+- **Vector normalization** (`EMBEDDING_NORMALIZE`, default `true`) — more stable cosine search.
+- **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `model`); unchanged files are skipped at startup and on watcher events.
+- **Batching** — texts are sent to `api` in `EMBED_BATCH_SIZE` batches instead of the whole file at once.
+- **Memory limits** — `mem_limit` of 1 GB for `embedder` and 512 MB for `gateway` prevents runaway indexing from consuming the host.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — less VRAM fragmentation.
+
+To free the GPU entirely, move embeddings to CPU:
 
 ```env
 EMBEDDING_DEVICE=cpu
 EMBEDDING_DTYPE=float32
 ```
 
-300M-модель на CPU даёт ~10–30 мс на чанк: для индексации и одиночных запросов этого достаточно, а GPU остаётся свободной.
+Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but background indexing and single queries are usually still tolerable.
 
-### Смена модели embeddings
+## Known limitations
 
-Модель задаётся одной переменной — её читают оба сервиса (`api` грузит веса, `embedder` использует значение как метку для инвалидации индекса):
+- **No retrieval evaluation** — `RAG_TOP_K` and `RAG_MIN_SCORE` are not tuned against a labelled question set.
+- **Dense search only** — exact identifiers, product codes, and rare names can be missed; there is no sparse/BM25 hybrid.
+- **No reranker** — the top-`k` dense results go straight into the prompt.
+- **Fixed-size chunking** — no heading/paragraph awareness and no section metadata for citations.
+- **Stale vectors after downtime** — files deleted or renamed while the stack is stopped remain searchable.
+- **No API/Qdrant healthchecks** — `depends_on` does not wait for readiness; Qdrant is pulled as `latest`.
+- **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
+- **Multi-turn follow-ups** — only the last user message is embedded, so elliptical questions ("what about the second one?") retrieve poorly.
+- **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
+- **Model-dependent threshold** — `RAG_MIN_SCORE` must be re-tuned after changing the embedding model.
 
-```env
-EMBEDDING_MODEL=google/embeddinggemma-300m
-```
-
-| Модель | dim | fp16 | Комментарий |
-|---|---|---|---|
-| `google/embeddinggemma-300m` | 768 | ≈ 0.6 ГБ | оптимум для 8 ГБ GPU |
-| `intfloat/multilingual-e5-small` | 384 | ≈ 0.24 ГБ | самый быстрый вариант |
-| `BAAI/bge-m3` | 1024 | ≈ 1.1 ГБ | лучшее качество, мультиязычность |
-
-> При смене модели меняется размерность векторов. Коллекция Qdrant пересоздаётся автоматически (`recreating the collection` в логе), после чего все документы индексируются заново. Если хотите начать с чистого листа вручную — удалите `qdrant_data/` при остановленном стеке.
-
-При первом запуске модель скачивается в `./models/hf-cache` (том `HF_HOME`), поэтому перезапуск контейнера не тянет её заново.
-
-## 📥 Индексация документов
-
-Скопируйте текстовые файлы в `data/documents`:
-
-```powershell
-Copy-Item .\mydocument.txt .\data\documents\
-```
-
-`embedder` обнаружит файл через ~1 секунду, порежет на чанки, запросит векторы у `api` и запишет их в Qdrant. Старые чанки файла заменяются, при удалении файла — удаляются из базы, а неизменившиеся файлы при рестарте пропускаются.
-
-Логи:
+## Troubleshooting
 
 ```bash
-docker-compose logs -f embedder
-```
-
-```
-2026-11-15 13:14:33 INFO [embedder] Stable event for /data/documents/mydocument.txt
-2026-11-15 13:14:35 INFO [embedder] Upserted 5 chunks for /data/documents/mydocument.txt
-2026-11-15 13:14:40 INFO [embedder] Unchanged, skipping /data/documents/other.txt
-```
-
-## 🐛 Troubleshooting
-
-```bash
-docker-compose ps              # статус контейнеров
-docker-compose logs -f         # все логи
-docker-compose logs -f gateway
+docker compose ps                 # container status
+docker compose logs -f            # all logs
+docker compose logs -f gateway
 curl http://localhost:8001/health
-python scripts/smoke_test.py --api-key <ключ>
+python scripts/smoke_test.py --api-key <key>
 ```
 
-**401 Unauthorized** — ключ не задан или не совпадает с `API_KEYS`; после правки `.env` нужен `docker-compose up -d` (пересоздание контейнера).
+**401 Unauthorized** — the key is missing or does not match `API_KEYS`; after editing `.env`, recreate the container (`docker compose up -d`).
 
-**`status: degraded`** — одна из зависимостей недоступна; смотрите блок `dependencies` в `/health`.
+**`status: degraded`** — one dependency is unavailable; inspect `dependencies` in `/health`.
 
-**`503 No model server is configured`** — пуст `UPSTREAM_BASE_URL`. Укажите адрес LLM-сервера в `.env` и пересоздайте контейнер gateway.
+**`503 No model server is configured`** — `UPSTREAM_BASE_URL` is empty. Set the LLM server URL in `.env` and recreate the gateway container.
 
-**`502 upstream_auth_failed`** — модельный сервер отклонил ключ **шлюза**. Проверьте `UPSTREAM_API_KEY` (и что сервер вообще ждёт Bearer). Ключ агента тут ни при чём, менять его не нужно.
+**`502 upstream_auth_failed`** — the model server rejected the **gateway's** key. Check `UPSTREAM_API_KEY` (and whether the server expects Bearer auth). The agent's key is irrelevant here.
 
-**Пустые ответы без контекста** — проверьте `X-RAG-Hits` в ответе: `0` означает, что либо в коллекции нет документов (`/collection/info`), либо все результаты ниже `RAG_MIN_SCORE`.
+**Empty answers without context** — check `X-RAG-Hits` in the response: `0` means either the collection is empty (`/collection/info`) or all results scored below `RAG_MIN_SCORE`.
 
-**Модель не загружается (embeddings)** — проверьте доступ к HuggingFace и место на диске: `docker-compose logs api | Select-String "Loading model"`.
+**Model fails to load** — check Hugging Face access and disk space: `docker compose logs api | Select-String "Loading model"`. Qwen3-Embedding needs `transformers>=4.51`; older versions fail with `KeyError: 'qwen3'`.
 
-**`CUDA out of memory`** — модель эмбеддингов не помещается в VRAM. Поставьте `EMBEDDING_DEVICE=cpu`: LLM живёт на другом хосте, так что GPU нужна только для эмбеддингов.
+**`CUDA out of memory`** — the embedding model does not fit in VRAM. Set `EMBEDDING_DEVICE=cpu`; the LLM is on another host, so the GPU is needed only for embeddings. Qwen3-Embedding-0.6B takes ≈ 1.2 GB in fp16.
 
-**Индексация долго стартует** — полный проход выполняется только на пустой коллекции; дальше `embedder` пропускает файлы с совпадающей подписью (`mtime`/размер/конфиг чанков/модель).
+**Indexing takes long to start** — a full pass runs on an empty collection and after a model or chunking change; otherwise `embedder` skips files with a matching signature.
 
-**Ошибка размерности вектора** — коллекция создана под другую модель; удалите `qdrant_data/*` при остановленном стеке и перезапустите.
+**Vector dimension error** — the collection was created for a different model (for example, 768 for embeddinggemma while the current model produces 1024). Delete `qdrant_data/*` while the stack is stopped and restart. A normal model switch recreates the collection automatically.
 
-**Qdrant падает** — очистите данные:
+**Qdrant crashes** — clear its data:
 
 ```powershell
-docker-compose down
+docker compose down
 Remove-Item -Path .\qdrant_data\* -Recurse -Force
-docker-compose up -d
+docker compose up -d
 ```
 
-**WebUI: порт 3000 занят** — сервис удалён; если остался старый контейнер, выполните `docker-compose rm -sf open-webui`.
+## Monitoring
 
-## 📊 Мониторинг
-
-- Qdrant Dashboard: http://localhost:6333/dashboard
+- Qdrant dashboard: http://localhost:6333/dashboard
 - API Swagger: http://localhost:8000/docs
 - Gateway Swagger: http://localhost:8001/docs
 - Gateway health: http://localhost:8001/health
 
-## 🛠️ Разработка
+## Development
 
 ```bash
-docker-compose up -d --build      # пересборка после изменений
-docker-compose restart gateway
+docker compose up -d --build      # rebuild after changes
+docker compose restart gateway
 ```
 
-Структура кода:
+Code map:
 
 - `gateway/main.py` — `require_api_key`, `_rag_search`, `_inject_context`, `/v1/chat/completions`, `/v1/embeddings`
-- `api/main.py` — `/search` (Qdrant `query_points`, с фолбэком на старый `search`), `/embed`, `/v1/embeddings`
-- `api/embedder.py` — `Embedder`: загрузка модели в fp16, батчи, нормализация
+- `api/main.py` — `/search` (Qdrant `query_points`, with a fallback to the older `search`), `/embed`, `/v1/embeddings`
+- `api/embedder.py` — `Embedder`: fp16 loading, batching, normalization, query prompt
 - `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature`, `split_text_into_chunks`
-- `embedder/embedder.py` — `RemoteEmbedder`: HTTP-клиент к `api` с ретраями
-- `embedder/vector_db.py` — `VectorDB`: upsert с подписью файла, `is_up_to_date`, пересоздание коллекции при смене размерности
+- `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
+- `embedder/vector_db.py` — `VectorDB`: upsert with a file signature, `is_up_to_date`, collection recreation on dimension change
+- `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
 
-## 📝 TODO / Планы развития
+There is no unit-test suite yet; `scripts/smoke_test.py` is the current end-to-end check.
 
-### Переход на PostgreSQL с pgvector
+## Roadmap
 
-**Зачем:**
-- Снижение затрат на инфраструктуру (один сервис вместо отдельной Qdrant БД)
-- Унификация хранения данных (метаданные + векторы в одной СУБД)
-- Возможность использования стандартных PostgreSQL инструментов для backup/restore
-- Поддержка сложных SQL-запросов для фильтрации
+The actionable, prioritized plan is in **[TODO.md](TODO.md)**. Summary:
 
-**Что нужно:**
+| Priority | Item |
+|---|---|
+| P0 | Retrieval evaluation harness (recall@k, MRR) |
+| P0 | Startup reconciliation of stale vectors |
+| P0 | Tune `RAG_TOP_K` / `RAG_MIN_SCORE` against the evaluation set |
+| P1 | Reranker (retrieve 30–50, pass 5–8) |
+| P1 | Structure-aware chunking and citation metadata |
+| P1 | Multi-turn query rewriting |
+| P2 | Hybrid BM25 + dense search with RRF |
+| P2 | Healthchecks, pinned Qdrant version, snapshots |
+| P3 | TEI/vLLM backend, query cache, quantization, larger model, pgvector |
 
-1. **Добавить PostgreSQL контейнер в docker-compose.yaml:**
-   ```yaml
-   postgres:
-     image: pgvector/pgvector:pg16
-     environment:
-       POSTGRES_DB: rag_db
-       POSTGRES_USER: rag_user
-       POSTGRES_PASSWORD: rag_password
-     volumes:
-       - ./postgres_data:/var/lib/postgresql/data
-     ports:
-       - "5432:5432"
-   ```
-
-2. **Обновить embedder/vector_db.py:**
-   - Заменить `qdrant-client` на `psycopg2` / `asyncpg`
-   - Использовать pgvector extension для векторного поиска
-   - Создать таблицу с колонкой типа `vector(2304)` для embeddings
-   - Использовать HNSW или IVFFlat индексы для быстрого поиска
-
-3. **Схема таблицы:**
-   ```sql
-   CREATE EXTENSION IF NOT EXISTS vector;
-
-   CREATE TABLE documents (
-     id BIGINT PRIMARY KEY,
-     file_path TEXT NOT NULL,
-     chunk_index INTEGER NOT NULL,
-     content TEXT NOT NULL,
-     embedding vector(2304),
-     created_at TIMESTAMP DEFAULT NOW()
-   );
-
-   CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
-   ```
-
-4. **Обновить сервис `api`:**
-   - Использовать SQL-запросы для поиска с `<=>` оператором (cosine distance)
-   - Пример: `SELECT *, 1 - (embedding <=> $1) AS similarity FROM documents ORDER BY embedding <=> $1 LIMIT 5`
-
-**Преимущества:**
-- ✅ Меньше памяти (нет отдельного Qdrant процесса)
-- ✅ Проще backup/восстановление
-- ✅ Поддержка транзакций
-- ✅ Интеграция с существующими PostgreSQL инструментами
-
-**Недостатки:**
-- ⚠️ Может быть медленнее для очень больших датасетов (миллионы векторов)
-- ⚠️ Требует ручной настройки индексов для оптимизации
-
-## 📚 Полезные ссылки
+## Useful links
 
 - [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
 - [Qdrant Documentation](https://qdrant.tech/documentation/)
+- [Qwen3-Embedding-0.6B model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
 - [vLLM OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
 - [LM Studio local server](https://lmstudio.ai/docs/app/api)
 - [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
 - [Sentence Transformers](https://www.sbert.net/)
 - [pgvector Extension](https://github.com/pgvector/pgvector)
 
-## 📄 Лицензия
+## License
 
 MIT
 
-## 🤝 Поддержка
+## Support
 
-При возникновении проблем:
-1. Проверьте логи: `docker-compose logs`
-2. Убедитесь что GPU доступен: `nvidia-smi`
-3. Запустите smoke-тест: `python scripts/smoke_test.py`
+1. Check the logs: `docker compose logs`
+2. Verify the GPU is visible: `nvidia-smi`
+3. Run the smoke test: `python scripts/smoke_test.py`

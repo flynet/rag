@@ -4,6 +4,10 @@
 The model is loaded exactly once per deployment. The indexing service
 (`embedder`) is a thin HTTP client and has no torch / CUDA at all, so a single
 machine does not keep two copies of the weights and two CUDA contexts.
+
+Retrieval models can be asymmetric: Qwen3-Embedding expects an instruction on
+the query side only, while documents are encoded as plain text. Hence the two
+entry points below: `embed()` for documents and `embed_query()` for queries.
 """
 
 import asyncio
@@ -46,10 +50,22 @@ def resolve_dtype(name: Optional[str], device: str):
     return dtype
 
 
+def _embedding_dim(model: SentenceTransformer) -> Optional[int]:
+    """Read the embedding dimension across sentence-transformers versions."""
+    # v5.4+ renamed the getter; the old name still exists but is deprecated.
+    for name in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        getter = getattr(model, name, None)
+        if callable(getter):
+            return getter()
+    return None
+
+
 class Embedder:
     """Async wrapper around SentenceTransformer.
 
-    expose: async embed(list[str]) -> np.ndarray (n, dim)
+    expose:
+        async embed(list[str]) -> np.ndarray (n, dim)          # documents
+        async embed_query(list[str]) -> np.ndarray (n, dim)    # queries
     """
 
     def __init__(
@@ -60,12 +76,14 @@ class Embedder:
         batch_size: int = 32,
         normalize: bool = True,
         max_seq_length: Optional[int] = None,
+        query_prompt: Optional[str] = "query",
     ):
         self.model_path = model_path
         self.device = device
         self.dtype = resolve_dtype(dtype, device)
         self.batch_size = max(1, batch_size)
         self.normalize = normalize
+        self.query_prompt = (query_prompt or "").strip() or None
 
         log.info(
             "Loading model %s (device=%s, dtype=%s, batch=%d)",
@@ -84,21 +102,57 @@ class Embedder:
         if max_seq_length:
             self.model.max_seq_length = max_seq_length
 
-        self.dim = int(self.model.get_sentence_embedding_dimension() or 0)
-        log.info("Model ready (dim=%d)", self.dim)
+        self.dim = int(_embedding_dim(self.model) or 0)
+        log.info("Model ready (dim=%d, max_seq_length=%s)", self.dim, self.model.max_seq_length)
 
-    def _encode_sync(self, texts: List[str]):
+        # Qwen3-Embedding stores a retrieval instruction under the "query"
+        # prompt. If the model has none, queries are encoded as plain text.
+        prompts = getattr(self.model, "prompts", None) or {}
+        if self.query_prompt:
+            prompt_text = prompts.get(self.query_prompt)
+            if prompt_text is None:
+                log.warning(
+                    "Model has no %r prompt (available: %s) - queries will be "
+                    "encoded without an instruction",
+                    self.query_prompt,
+                    ", ".join(sorted(prompts)) or "none",
+                )
+                self.query_prompt = None
+            elif not prompt_text.strip():
+                log.info(
+                    "Model's %r prompt is empty - queries will be encoded "
+                    "without an instruction",
+                    self.query_prompt,
+                )
+                self.query_prompt = None
+            else:
+                log.info("Using query prompt %r: %r", self.query_prompt, prompt_text)
+        else:
+            log.info("Query prompt disabled - queries and documents are encoded identically")
+
+    def _encode_sync(self, texts: List[str], prompt_name: Optional[str] = None):
         """Synchronous embedding call. Returns np.ndarray shape=(len(texts), dim)."""
+        kwargs = {}
+        if prompt_name:
+            kwargs["prompt_name"] = prompt_name
         return self.model.encode(
             texts,
             batch_size=self.batch_size,
             convert_to_numpy=True,
             normalize_embeddings=self.normalize,
             show_progress_bar=False,
+            **kwargs,
         )
 
-    async def embed(self, texts: List[str]):
+    async def embed(self, texts: List[str], prompt_name: Optional[str] = None):
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+
         loop = asyncio.get_running_loop()
         # Run embedding in a background thread to not block the event loop
-        vectors = await loop.run_in_executor(None, self._encode_sync, texts)
+        vectors = await loop.run_in_executor(None, self._encode_sync, texts, prompt_name)
         return np.asarray(vectors, dtype=np.float32)
+
+    async def embed_query(self, texts: List[str]):
+        """Encode queries with the model's query prompt (when it has one)."""
+        return await self.embed(texts, prompt_name=self.query_prompt)

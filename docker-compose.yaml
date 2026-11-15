@@ -24,7 +24,7 @@ services:
       - WATCH_PATH=/data/documents
       - DEBOUNCE_SEC=1.0
       - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-google/embeddinggemma-300m}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     mem_limit: 1g
 
@@ -48,11 +48,16 @@ services:
     depends_on:
       - qdrant
     environment:
-      - MODEL_PATH=${EMBEDDING_MODEL:-google/embeddinggemma-300m}
+      - MODEL_PATH=${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
       - HF_HOME=/models/hf-cache
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cuda}
       - EMBEDDING_DTYPE=${EMBEDDING_DTYPE:-float16}
       - EMBEDDING_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
+      # Имя retrieval-промпта модели для запросов (Qwen3-Embedding: "query").
+      # Пусто - кодировать запросы без инструкции, как документы.
+      - EMBEDDING_QUERY_PROMPT=${EMBEDDING_QUERY_PROMPT:-query}
+      # Ограничение длины входа в токенах (32k у модели; чанки и запросы короче)
+      - EMBEDDING_MAX_SEQ_LENGTH=${EMBEDDING_MAX_SEQ_LENGTH:-8192}
       - EMBEDDING_MODEL_NAME=rag-embeddings
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333

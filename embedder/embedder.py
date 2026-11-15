@@ -43,8 +43,13 @@ class RemoteEmbedder:
             response.raise_for_status()
             return response.json()
 
-    async def wait_ready(self, attempts: int = 90, delay: float = 2.0) -> int:
-        """Block until `api` reports a loaded model. Returns the vector dimension."""
+    async def wait_ready(self, attempts: int = 300, delay: float = 2.0) -> int:
+        """Block until `api` reports a loaded model. Returns the vector dimension.
+
+        The default gives ~10 minutes: the first start has to download and load
+        the embedding model (Qwen3-Embedding-0.6B is ~1.2 GB) before `api`
+        answers `/health`.
+        """
         last_error: Optional[Exception] = None
 
         for attempt in range(1, attempts + 1):
