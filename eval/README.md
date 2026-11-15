@@ -50,6 +50,11 @@ gateway mode must use `file`, `chunk` and `section` (the loader rejects
 
 `eval/questions.example.jsonl` contains schema examples for the sample document.
 `eval/questions.jsonl` is the real question set used for the baseline.
+`eval/questions.multiturn.jsonl` is the follow-up set: each line carries `history`
+(the previous user turns) plus a short follow-up question, and its ground truth
+uses `file` + `section` only, so the same file works in both modes. It measures
+what retrieval does when the user asks "and the min score?" without repeating the
+topic — the gateway's follow-up rewrite (P1.3) is what changes it.
 
 ## Corpus
 
@@ -94,13 +99,17 @@ python scripts/eval_retrieval.py --questions eval/questions.jsonl
 python scripts/eval_retrieval.py --questions eval/questions.jsonl --sweep \
     --json-out eval/baseline.json
 
-# fail the run if quality drops below a gate
+# fail the run if quality drops below the recorded gates
 python scripts/eval_retrieval.py --questions eval/questions.jsonl \
-    --min-recall 0.85 --min-mrr 0.70
+    --min-recall 0.70 --min-mrr 0.35
 
 # gateway behavior, including multi-turn follow-ups
 python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
     --api-key sk-local --sweep
+
+# follow-up questions with conversation history through the gateway
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl \
+    --mode gateway --sweep --json-out eval/multiturn-gateway.json
 ```
 
 Useful options:
@@ -160,6 +169,32 @@ In `search` mode `min_score` is `null`, so metrics measure the retriever itself.
 In `gateway` mode the candidates requested are `X-RAG-TOP-K=20` with
 `X-RAG-MIN-SCORE` disabled, so the raw candidate list is recorded and thresholds
 are applied by the sweep.
+
+## Current baseline
+
+The dataset is 60 questions (`eval/questions.jsonl`) over the committed corpus
+(202 chunks: `README.md` 68, `TODO.md` 80, `env_example.txt` 40,
+`eval_README.md` 13, `example.txt` 1). Ground truth is `file` + `text_contains`,
+validated offline against `eval/corpus` and checked against the indexed chunks,
+so every needle exists in the collection. Measured with `top_k=50`,
+`min_score: null`:
+
+| Metric | Value | Recorded gate |
+|---|---|---|
+| recall@5 | 0.650 | — |
+| recall@10 | 0.767 | `--min-recall 0.70` |
+| MRR@10 | 0.396 | `--min-mrr 0.35` |
+| nDCG@10 | 0.526 | — |
+
+The gates sit just under the baseline, so they catch a regression without
+encoding the current quality as a target. `q-058` uses two `relevant` entries,
+which is what the acceptance criteria call a multi-chunk answer. 14 questions
+have no expected hit in the top 10, and they concentrate on short table rows
+(`Current state`, the configuration table, memory limits) — dense embeddings do
+best on narrative and heading chunks, so this is the target of hybrid search
+(P2.1) and threshold tuning (P0.3). The corpus is self-referential (project docs
+and the env template); real user documents and a held-out subset are still to be
+added.
 
 ## Building a good question set
 

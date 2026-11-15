@@ -178,9 +178,10 @@ def load_questions(path: Path, gateway: bool = False) -> List[Dict[str, Any]]:
 def check_corpus(questions: List[Dict[str, Any]], corpus_dir: Path) -> List[str]:
     """Validate ground truth against the corpus files, offline (no API calls).
 
-    Every `file` must exist in the corpus, and every `text_contains` /
-    `section` substring must occur in it. Used to catch a question set that
-    refers to documents that were renamed, edited, or never committed.
+    Every `file` must exist in the corpus. `text_contains` must occur in it as a
+    substring; `section` is a heading path, so each of its segments must occur in
+    the file. Used to catch a question set that refers to documents that were
+    renamed, edited, or never committed.
     """
     by_name: Dict[str, List[Path]] = {}
     for path in sorted(corpus_dir.rglob("*")):
@@ -198,14 +199,18 @@ def check_corpus(questions: List[Dict[str, Any]], corpus_dir: Path) -> List[str]
                 problems.append(f"{question['id']}: corpus file '{name}' not found in {corpus_dir}")
                 continue
             texts = [p.read_text(encoding="utf-8").casefold() for p in candidates]
-            for field in ("text_contains", "section"):
-                needle = expected.get(field)
-                if needle is None:
-                    continue
-                if not any(needle.casefold() in text for text in texts):
-                    problems.append(
-                        f"{question['id']}: {field} {needle!r} not in '{name}'"
-                    )
+
+            needle = expected.get("text_contains")
+            if needle is not None and not any(needle.casefold() in text for text in texts):
+                problems.append(f"{question['id']}: text_contains {needle!r} not in '{name}'")
+
+            needle = expected.get("section")
+            if needle is not None:
+                # the section path is assembled from heading lines, so the joined
+                # string never appears in the file: check each segment
+                segments = [s.strip().casefold() for s in needle.split(">") if s.strip()]
+                if not any(all(s in text for s in segments) for text in texts):
+                    problems.append(f"{question['id']}: section {needle!r} not in '{name}'")
     return problems
 
 
@@ -408,18 +413,25 @@ def evaluate_gateway(gateway_url: str, api_key: str, model: str,
                 "section": str(hit.get("section") or ""),
                 "score": float(hit.get("score", 0.0)),
             }
-            for hit in decode_sources(response_headers.get("X-RAG-Sources"))
+            for hit in sources_from_headers(response_headers)
         ]
         results.append(_build_result(question, hits))
 
     return results
 
 
+def sources_from_headers(response_headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Read `X-RAG-Sources` from normalized (lowercased) response headers."""
+    return decode_sources(response_headers.get("x-rag-sources"))
+
+
 def _post_chat(chat_url: str, headers: Dict[str, str], payload: Dict[str, Any],
               timeout: float) -> Tuple[Any, Dict[str, str]]:
     with _open(chat_url, payload, "POST", headers, timeout) as response:
         body = json.loads(response.read())
-        return body, dict(response.headers)
+        # header names are case-insensitive in HTTP, and uvicorn delivers them
+        # lowercased, so normalize them before reading the RAG headers
+        return body, {key.lower(): value for key, value in dict(response.headers).items()}
 
 
 # --------------------------------------------------------------------------- #

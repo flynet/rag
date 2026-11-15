@@ -176,6 +176,20 @@ class SourceHeaderTests(unittest.TestCase):
         self.assertEqual(ev.decode_sources(None), [])
         self.assertEqual(ev.decode_sources(""), [])
 
+    def test_normalized_headers_are_read_case_insensitively(self):
+        payload = [{"file": "/data/documents/a.txt", "chunk": 2, "score": 0.61}]
+        raw = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+        # uvicorn delivers header names lowercased
+        self.assertEqual(ev.sources_from_headers({"x-rag-sources": raw}), payload)
+        # normalize the way _post_chat does, then read
+        self.assertEqual(
+            ev.sources_from_headers({k.lower(): v for k, v in {"X-RAG-Sources": raw}.items()}),
+            payload,
+        )
+        self.assertEqual(ev.sources_from_headers({}), [])
+
 
 class DatasetTests(unittest.TestCase):
     def _write(self, lines):
@@ -224,16 +238,19 @@ class DatasetTests(unittest.TestCase):
 class CorpusCheckTests(unittest.TestCase):
     def setUp(self):
         self.corpus = Path(tempfile.mkdtemp())
-        (self.corpus / "README.md").write_text("# Guide\n\nAlpha details\n", encoding="utf-8")
+        (self.corpus / "README.md").write_text("# Guide\n\nAlpha details\n\n## Setup\n", encoding="utf-8")
 
     def test_ground_truth_matches(self):
         questions = [{"id": "q1", "relevant": [{"file": "README.md", "text_contains": "alpha"}]}]
         self.assertEqual(ev.check_corpus(questions, self.corpus), [])
 
-    def test_section_is_validated_against_the_corpus(self):
-        questions = [{"id": "q1", "relevant": [{"file": "README.md", "section": "# Guide"}]}]
+    def test_section_path_is_checked_segment_by_segment(self):
+        # the joined path never appears in the file, its segments do
+        questions = [{"id": "q1", "relevant": [{"file": "README.md", "section": "Guide > Setup"}]}]
         self.assertEqual(ev.check_corpus(questions, self.corpus), [])
-        questions = [{"id": "q2", "relevant": [{"file": "README.md", "section": "## Missing"}]}]
+
+    def test_section_segment_missing_from_the_file_is_reported(self):
+        questions = [{"id": "q2", "relevant": [{"file": "README.md", "section": "Guide > Missing"}]}]
         problems = ev.check_corpus(questions, self.corpus)
         self.assertEqual(len(problems), 1)
         self.assertIn("section", problems[0])
