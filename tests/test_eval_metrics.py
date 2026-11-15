@@ -5,7 +5,8 @@ Run from the repository root:
     python -m unittest discover -s tests -p "test_*.py"
 
 No GPU, API, or Docker is involved: the metric tests work on synthetic hit
-lists, and the HTTP session tests run against a local stub server on 127.0.0.1.
+lists, the latency statistics on plain lists, and the HTTP session and latency
+probe tests run against a local stub server on 127.0.0.1.
 """
 
 import base64
@@ -15,6 +16,7 @@ import math
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import eval_retrieval as ev  # noqa: E402
+import latency_probe as lp  # noqa: E402
 
 
 def hit(file: str, chunk: int, text: str, score: float):
@@ -279,8 +282,12 @@ class CorpusCheckTests(unittest.TestCase):
         self.assertTrue(any("not found" in problem for problem in problems))
 
 
-class _StubServer(http.server.HTTPServer):
-    """Local stub API: counts connections and bodies, no GPU, API, or Docker."""
+class _StubServer(http.server.ThreadingHTTPServer):
+    """Local stub API: counts connections and bodies, no GPU, API, or Docker.
+
+    Threading so several keep-alive connections can be served at the same time,
+    the way the real API does it.
+    """
 
     def __init__(self, handler_class):
         super().__init__(("127.0.0.1", 0), handler_class)
@@ -313,8 +320,13 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.server.bodies.append(json.loads(self.rfile.read(length)))
+        body = json.loads(self.rfile.read(length))
+        self.server.bodies.append(body)
         self.server.paths.append(self.path)
+
+        # a slow query lets the tests check that a time window stops the loop
+        if isinstance(body, dict) and body.get("query") == "slow":
+            time.sleep(0.15)
 
         if self.path == "/boom":
             self.send_response(422)
@@ -381,6 +393,61 @@ class SessionTests(unittest.TestCase):
         dead = ev.Session("http://127.0.0.1:1", 2.0)
         with self.assertRaises(ConnectionError):
             dead.post("/search", {"query": "alpha", "top_k": 1, "min_score": None})
+
+
+class LatencyTests(unittest.TestCase):
+    """The latency probe must reuse connections: connection setup on Windows
+    costs seconds, and measuring it would bury the number being measured."""
+
+    def setUp(self):
+        self.server = _StubServer(_StubHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_percentile_is_nearest_rank(self):
+        values = [float(i) for i in range(1, 101)]
+        self.assertEqual(lp.percentile(values, 0.50), 50.0)
+        self.assertEqual(lp.percentile(values, 0.95), 95.0)
+        self.assertEqual(lp.percentile(values, 0.99), 99.0)
+        self.assertEqual(lp.percentile([], 0.95), 0.0)
+
+    def test_summarise_reports_the_core_stats(self):
+        stats = lp.summarise([1.0, 2.0, 3.0])
+        self.assertEqual(stats["count"], 3)
+        self.assertEqual(stats["p50"], 2.0)
+        self.assertEqual(stats["p95"], 3.0)
+        self.assertAlmostEqual(stats["mean"], 2.0)
+        self.assertEqual(lp.summarise([])["count"], 0)
+
+    def test_measure_search_reuses_one_connection_per_worker(self):
+        sessions = [ev.Session(self.url, 10.0) for _ in range(2)]
+        try:
+            latencies = lp.measure_search(sessions, ["alpha", "beta"], 6)
+            self.assertEqual(len(latencies), 6)
+            self.assertEqual(len(self.server.bodies), 6)
+            # six requests, two workers: two connections, not six
+            self.assertEqual(self.server.connections, 2)
+            self.assertTrue(all(value > 0 for value in latencies))
+        finally:
+            for session in sessions:
+                session.close()
+
+    def test_duration_phase_stops_at_the_deadline(self):
+        session = ev.Session(self.url, 10.0)
+        try:
+            # the stub answers a "slow" query in 0.15s, so 1000 of them would
+            # take 150s; a 0.3s window must stop the loop after a few requests
+            latencies = lp.measure_search([session], ["slow"], 1000, duration=0.3)
+            self.assertGreater(len(latencies), 0)
+            self.assertLess(len(latencies), 5)
+            self.assertGreater(latencies[0], 0.1)
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":
