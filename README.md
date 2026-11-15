@@ -31,6 +31,8 @@ This is the state of the code in this repository, not a target design.
 | Deletion handling | Live watcher events + startup reconciliation of files deleted or renamed while the stack was stopped |
 | Qdrant | `qdrant/qdrant:v1.20.1` pinned via `QDRANT_VERSION`; storage on a named volume, snapshots dir bind-mounted; no snapshot schedule |
 | Healthchecks | Gateway, `api`, and Qdrant; `embedder` waits for Qdrant and `api` |
+| Chat + RAG injection | Verified end to end against a self-hosted OpenAI-compatible server: non-stream and streaming answers cite the retrieved section, `X-RAG-Sources` / `X-RAG-Hits` headers are valid, `X-RAG: off` disables retrieval, unrelated questions produce 0 hits |
+| Startup E2E | `docker compose up -d` reaches healthy `qdrant`, `api`, `gateway` plus a running `embedder` on the RTX 4060 machine; `scripts/smoke_test.py` passes all 5 checks |
 | Embedding deps | `sentence-transformers>=5.0,<6`, `transformers>=4.51,<5` |
 | Target hardware | One GPU, tested on RTX 4060 Laptop with 8 GB VRAM |
 

@@ -176,7 +176,7 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - Citations can point to a section and character range.
 - Evaluation improves or stays flat; indexing time is acceptable.
 
-**Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. Remaining work: run with Docker, re-index, and compare against the evaluation baseline. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words) but not yet by the live pipeline.
+**Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. The live pipeline is verified through Docker: `embedder` indexed `example.txt` (`Upserted 1 chunks for /data/documents/example.txt`), `api` `/collection/info` reports `points=1 dim=1024`, `/collection/sample` and `X-RAG-Sources` carry `title`, `section`, `char_start`, `char_end`, and the chat answer cited `/data/documents/example.txt` from the injected passage. Remaining work: run the evaluation on a real corpus and compare against the baseline. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words).
 
 ### [~] P1.3 Multi-turn query rewriting
 
@@ -195,7 +195,7 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - Single-turn questions do not regress.
 - Added latency is bounded and documented.
 
-**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The evaluation harness currently sends a single `question` to `/search`, so it cannot measure gateway-level rewriting yet; that is the remaining work together with the dataset.
+**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The gateway retrieval path is verified live against a self-hosted OpenAI-compatible server (`UPSTREAM_BASE_URL=http://10.0.0.99:5001/v1`): non-stream and streaming chat both returned grounded answers citing the retrieved section, `X-RAG-Sources` decoded to valid entries, `X-RAG: off` produced `X-RAG-Hits=0`, and an unrelated question produced 0 hits. The evaluation harness currently sends a single `question` to `/search`, so it cannot measure gateway-level rewriting yet; that is the remaining work together with the dataset.
 
 ---
 
@@ -237,7 +237,7 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - `docker compose ps` shows meaningful health states.
 - Upgrading Qdrant is a deliberate, tested action.
 
-**Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. E2E (`docker compose up` with the GPU stack) is still pending because Docker Desktop is not running here.
+**Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). E2E verified live on this machine with the GPU stack: `docker compose up -d` reached a healthy state without a crash loop, `docker compose ps` showed `qdrant`, `api`, `gateway` healthy and `embedder` running, `api` logged `Startup complete`, `embedder` logged stale-vector reconciliation and the watcher (`Started watcher on /data/documents (debounce 1.0s)`), and `python scripts/smoke_test.py` passed all 5 checks against the gateway with a real LLM upstream. There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. Storage now lives on a named volume (see P2.3 notes).
 
 ### [x] P2.3 Qdrant snapshots and restore — done, restore verified live
 
