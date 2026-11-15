@@ -784,7 +784,8 @@ Code map:
 - `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
 - `embedder/vector_db.py` — `VectorDB`: upsert with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`, collection recreation on dimension change
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
-- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation
+- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, one keep-alive connection for the whole run
+- `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, and `chunks_added`
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
 Unit tests for the evaluation math (matching, metrics, sweep grid, dataset and corpus validation) run without GPU, API, or Docker:

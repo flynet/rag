@@ -171,12 +171,13 @@ class SweepTests(unittest.TestCase):
 
     def test_markdown_renders_every_metric_table(self):
         grid = ev.sweep(self.results, [3, 5], [0.5, ev.NO_THRESHOLD])
-        text = ev.sweep_markdown(grid, grid["top_ks"], "2026-01-01T00:00:00+00:00")
+        text = ev.sweep_markdown(grid, grid["top_ks"], "2026-01-01T00:00:00+00:00", "eval/sweep-multiturn.md")
         for metric in ("recall@3", "recall@5", "mrr@3", "injected@5", "zero_context@3"):
             self.assertIn(metric, text)
         self.assertIn("| off |", text)
         self.assertIn("| 0.50 |", text)
         self.assertEqual(text.count("## "), 4)
+        self.assertIn("--sweep-md eval/sweep-multiturn.md", text)
 
 
 class SourceHeaderTests(unittest.TestCase):
