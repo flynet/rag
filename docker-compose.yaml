@@ -119,6 +119,10 @@ services:
       - ENABLE_RAG=${ENABLE_RAG:-true}
       - RAG_TOP_K=${RAG_TOP_K:-3}
       - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.5}
+      # off | concat | llm - rewrite follow-up questions before retrieval
+      - RAG_QUERY_REWRITE=${RAG_QUERY_REWRITE:-off}
+      - RAG_REWRITE_HISTORY=${RAG_REWRITE_HISTORY:-3}
+      - RAG_REWRITE_TIMEOUT=${RAG_REWRITE_TIMEOUT:-10}
       - UPSTREAM_TIMEOUT=${UPSTREAM_TIMEOUT:-600}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Comma-separated bearer tokens. Empty = authentication disabled.

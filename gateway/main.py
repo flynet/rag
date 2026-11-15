@@ -36,8 +36,9 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, Header, Request
@@ -108,6 +109,21 @@ RAG_MAX_TOP_K = _env_int("RAG_MAX_TOP_K", 20)
 RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", 0.5)
 RAG_TIMEOUT = _env_float("RAG_TIMEOUT", 30.0)
 
+# Follow-up query handling: off | concat | llm. "concat" joins previous user
+# turns for short/elliptical messages; "llm" asks the upstream model to rewrite
+# the query, falling back to concatenation when the call fails.
+RAG_QUERY_REWRITE = os.environ.get("RAG_QUERY_REWRITE", "off").strip().lower() or "off"
+if RAG_QUERY_REWRITE not in {"off", "concat", "llm"}:
+    log.warning(
+        "Unknown RAG_QUERY_REWRITE=%r - using 'off' (expected off|concat|llm)",
+        RAG_QUERY_REWRITE,
+    )
+    RAG_QUERY_REWRITE = "off"
+RAG_REWRITE_HISTORY = max(1, _env_int("RAG_REWRITE_HISTORY", 3))
+RAG_REWRITE_TIMEOUT = _env_float("RAG_REWRITE_TIMEOUT", 10.0)
+RAG_REWRITE_MAX_TOKENS = max(16, _env_int("RAG_REWRITE_MAX_TOKENS", 128))
+RAG_REWRITE_CACHE_SIZE = max(0, _env_int("RAG_REWRITE_CACHE_SIZE", 256))
+
 UPSTREAM_TIMEOUT = _env_float("UPSTREAM_TIMEOUT", 600.0)
 CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 10.0)
 MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_BYTES", 8_000_000)
@@ -124,6 +140,11 @@ if not UPSTREAM_BASE_URL:
     )
 if not API_KEYS:
     log.warning("API_KEYS is empty - the gateway accepts unauthenticated requests")
+if RAG_QUERY_REWRITE == "llm" and not UPSTREAM_BASE_URL:
+    log.warning(
+        "RAG_QUERY_REWRITE=llm requires UPSTREAM_BASE_URL - falling back to 'concat'"
+    )
+    RAG_QUERY_REWRITE = "concat"
 
 app = FastAPI(
     title="RAG Gateway",
@@ -246,6 +267,211 @@ def _last_user_query(messages: List[Any]) -> str:
     if not isinstance(last, dict) or last.get("role") != "user":
         return ""
     return _content_to_text(last.get("content")).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up query rewriting
+# --------------------------------------------------------------------------- #
+
+_FOLLOWUP_PREFIXES = (
+    "and ",
+    "but ",
+    "so ",
+    "then ",
+    "also ",
+    "what about ",
+    "how about ",
+    "why ",
+    "а ",
+    "и ",
+    "но ",
+    "тогда ",
+    "ещё ",
+    "еще ",
+    "что ",
+    "как ",
+    "почему ",
+)
+
+_FOLLOWUP_WORDS = frozenset(
+    {
+        "it",
+        "this",
+        "that",
+        "these",
+        "those",
+        "they",
+        "them",
+        "he",
+        "she",
+        "his",
+        "her",
+        "its",
+        "their",
+        "first",
+        "second",
+        "third",
+        "last",
+        "previous",
+        "above",
+        "это",
+        "этот",
+        "эта",
+        "эти",
+        "он",
+        "она",
+        "они",
+        "его",
+        "её",
+        "ее",
+        "их",
+        "первый",
+        "второй",
+        "третий",
+        "последний",
+        "предыдущий",
+        "выше",
+    }
+)
+
+_rewrite_cache: Dict[Tuple[str, str, str], str] = {}
+
+
+def _history_user_texts(messages: List[Any], limit: int) -> List[str]:
+    """User messages before the final turn, oldest first."""
+    texts: List[str] = []
+    for message in messages[:-1]:
+        if isinstance(message, dict) and message.get("role") == "user":
+            text = _content_to_text(message.get("content")).strip()
+            if text:
+                texts.append(text)
+    return texts[-limit:]
+
+
+def _format_history(messages: List[Any], limit: int) -> str:
+    """Recent user/assistant turns as plain text for the rewrite prompt."""
+    turns: List[str] = []
+    for message in messages[:-1]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _content_to_text(message.get("content")).strip()
+        if text:
+            turns.append(f"{role}: {text[:1000]}")
+    return "\n".join(turns[-limit * 2 :])
+
+
+def _is_follow_up(query: str) -> bool:
+    """Heuristic: short/elliptical messages and anaphora usually need history."""
+    text = query.strip()
+    if not text:
+        return False
+    words = re.findall(r"[\w']+", text.casefold())
+    if len(words) <= 5:
+        return True
+    if text.casefold().startswith(_FOLLOWUP_PREFIXES):
+        return True
+    return any(word in _FOLLOWUP_WORDS for word in words)
+
+
+def _concat_query(history: List[str], query: str) -> str:
+    """Cheap rewrite: prepend recent user turns to the current question."""
+    parts = [text[-500:] for text in history[-RAG_REWRITE_HISTORY:]]
+    parts.append(query)
+    return "\n".join(parts)[-2000:]
+
+
+def _cache_rewrite(key: Tuple[str, str, str], value: str) -> None:
+    if RAG_REWRITE_CACHE_SIZE <= 0:
+        return
+    if len(_rewrite_cache) >= RAG_REWRITE_CACHE_SIZE:
+        _rewrite_cache.pop(next(iter(_rewrite_cache)))
+    _rewrite_cache[key] = value
+
+
+async def _rewrite_query_llm(history_text: str, query: str, model: str) -> str:
+    """Ask the upstream model for a standalone retrieval query."""
+    system = (
+        "Rewrite the user's latest message as a standalone search query. "
+        "Use the conversation history only to resolve references such as "
+        "'it', 'the second one', or 'that'. Do not answer the question. "
+        "Return only the rewritten query, with no quotes, labels, or explanation."
+    )
+    user_content = (
+        f"Conversation history:\n{history_text}\n\n"
+        f"Latest user message:\n{query[:4000]}\n\n"
+        "Standalone search query:"
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+        "max_tokens": RAG_REWRITE_MAX_TOKENS,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=RAG_REWRITE_TIMEOUT) as client:
+        response = await client.post(
+            _upstream_url("/chat/completions"),
+            json=body,
+            headers=_upstream_headers(False),
+        )
+    response.raise_for_status()
+
+    payload = response.json()
+    content = (
+        (payload.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    )
+    content = " ".join(str(content).split()).strip().strip('"').strip("'").strip()
+    for prefix in ("search query:", "query:"):
+        if content.casefold().startswith(prefix):
+            content = content[len(prefix) :].strip()
+    if not content:
+        raise ValueError("the model returned an empty rewrite")
+    return content[:500]
+
+
+async def _prepare_retrieval_query(
+    messages: List[Any], query: str, model: str
+) -> str:
+    """Return the query to embed, optionally resolved against the history."""
+    if RAG_QUERY_REWRITE == "off":
+        return query
+
+    history = _history_user_texts(messages, RAG_REWRITE_HISTORY)
+    if not history:
+        return query
+
+    if RAG_QUERY_REWRITE == "concat":
+        if not _is_follow_up(query):
+            return query
+        return _concat_query(history, query)
+
+    # llm: only spend an extra call on messages that look like follow-ups.
+    if not _is_follow_up(query):
+        return query
+
+    history_text = _format_history(messages, RAG_REWRITE_HISTORY)
+    cache_key = (model, history_text, query)
+    cached = _rewrite_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        rewritten = await _rewrite_query_llm(history_text, query, model)
+    except Exception as exc:  # noqa: BLE001 - retrieval must never break chat
+        log.warning(
+            "Query rewrite failed, falling back to concatenation: %s", exc
+        )
+        return _concat_query(history, query)
+
+    _cache_rewrite(cache_key, rewritten)
+    return rewritten
 
 
 def _rag_settings(
@@ -534,7 +760,19 @@ async def chat_completions(
         query = _last_user_query(messages)
         if query:
             try:
-                hits = await _rag_search(query, top_k, min_score)
+                retrieval_query = await _prepare_retrieval_query(messages, query, model)
+            except Exception as exc:  # noqa: BLE001 - never break chat over a rewrite
+                log.warning("Query rewrite failed, using the raw query: %s", exc)
+                retrieval_query = query
+            if retrieval_query != query:
+                log.info(
+                    "Retrieval query rewritten (%s): %r -> %r",
+                    RAG_QUERY_REWRITE,
+                    query[:80],
+                    retrieval_query[:120],
+                )
+            try:
+                hits = await _rag_search(retrieval_query, top_k, min_score)
             except Exception as exc:  # noqa: BLE001 - RAG must never break chat
                 log.warning("RAG search failed, answering without context: %s", exc)
             if hits:
@@ -543,7 +781,7 @@ async def chat_completions(
                     len(hits),
                     top_k,
                     model,
-                    query[:120],
+                    retrieval_query[:120],
                 )
                 body = {
                     **body,

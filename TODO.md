@@ -122,16 +122,16 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Notes:** implemented in `embedder/chunking.py` (`CHUNKER_VERSION = 2`). The title is prepended only to the embedding input; the payload keeps the original chunk text and offsets. `file_signature` includes `chunking_version`, so existing documents are re-indexed on the next start. Remaining work: run with Docker, re-index, and compare against the evaluation baseline. The chunker is covered by synthetic tests (sections, offsets, word boundaries, overlap, CRLF, long words) but not yet by the live pipeline.
 
-### [ ] P1.3 Multi-turn query rewriting
+### [~] P1.3 Multi-turn query rewriting
 
 **Why:** the gateway embeds only the last user message. A follow-up like "and the second one?" produces a meaningless query.
 
 **Scope:**
-- [ ] Detect follow-up turns (short/elliptical last message or existing history).
-- [ ] Option A (cheap): concatenate the last 2–3 user messages as the retrieval query.
-- [ ] Option B (better): rewrite the query with the upstream LLM using the last N turns; cache and time-box it.
-- [ ] Add an env flag (e.g. `RAG_QUERY_REWRITE=off|concat|llm`) and per-request control if useful.
-- [ ] Keep the current behavior inside tool loops (last message is `tool`/`assistant`).
+- [x] Detect follow-up turns (short/elliptical last message or existing history).
+- [x] Option A (cheap): concatenate the last 2–3 user messages as the retrieval query.
+- [x] Option B (better): rewrite the query with the upstream LLM using the last N turns; cache and time-box it.
+- [x] Add an env flag (`RAG_QUERY_REWRITE=off|concat|llm`).
+- [x] Keep the current behavior inside tool loops (last message is `tool`/`assistant`).
 - [ ] Extend the evaluation set with multi-turn follow-ups.
 
 **Acceptance criteria:**
@@ -139,7 +139,7 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 - Single-turn questions do not regress.
 - Added latency is bounded and documented.
 
-**Notes:** query rewriting adds an LLM call on the critical path; a timeout and a fallback to the raw query are mandatory.
+**Notes:** implemented in `gateway/main.py` (`_prepare_retrieval_query`, `_is_follow_up`, `_concat_query`, `_rewrite_query_llm`). Default is `off` until the evaluation set covers multi-turn cases; `concat` is deterministic, `llm` adds one upstream call with `RAG_REWRITE_TIMEOUT` (10s) and falls back to `concat`. Rewrites are cached in memory (`RAG_REWRITE_CACHE_SIZE`, default 256). The evaluation harness currently sends a single `question` to `/search`, so it cannot measure gateway-level rewriting yet; that is the remaining work together with the dataset.
 
 ---
 

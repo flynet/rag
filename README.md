@@ -21,6 +21,7 @@ This is the state of the code in this repository, not a target design.
 | Query encoding | Retrieval instruction from the model's `query` prompt (`EMBEDDING_QUERY_PROMPT=query`) |
 | Document encoding | Plain text, no instruction |
 | Retrieval | Dense cosine search in Qdrant; `RAG_TOP_K=3`, `RAG_MIN_SCORE=0.5` |
+| Multi-turn queries | Optional follow-up rewrite (`RAG_QUERY_REWRITE=off|concat|llm`), off by default |
 | Retrieval evaluation | `scripts/eval_retrieval.py` (recall@k / MRR@10 / nDCG@10); labelled dataset and baseline pending |
 | Reranking | None |
 | Hybrid / sparse search | None |
@@ -44,6 +45,7 @@ The gaps above and the improvement plan are tracked in **[TODO.md](TODO.md)**.
 - Bearer authentication with static keys
 - The upstream key stays in the gateway; the agent's `Authorization` header is never forwarded
 - Per-request RAG control via `X-RAG-*` headers
+- Optional follow-up query rewriting (`RAG_QUERY_REWRITE=concat|llm`), off by default
 - A single embedding-model instance shared by search and indexing; the indexer has no torch/CUDA
 - Incremental indexing: unchanged files are skipped based on a stored signature
 - Retrieval evaluation harness (`recall@k`, `MRR`, `nDCG`) with a JSONL question set
@@ -370,6 +372,16 @@ Context is injected only for a "fresh" user turn — when the last message in `m
 
 If the `api` service is unavailable, the gateway does **not** break chat: the request goes to the LLM without context and a `WARNING` is logged.
 
+#### Follow-up questions
+
+`RAG_QUERY_REWRITE` controls whether retrieval sees the conversation history:
+
+- `off` (default) — only the last user message is embedded.
+- `concat` — for short or elliptical messages ("and the second one?"), the last `RAG_REWRITE_HISTORY` user messages are joined with the current one.
+- `llm` — the gateway asks the upstream model to rewrite the message into a standalone query; this adds one upstream call, is bounded by `RAG_REWRITE_TIMEOUT`, and falls back to `concat` on failure.
+
+Tool loops are unchanged: retrieval still runs only for a fresh user turn. The rewrite is a heuristic; enable it after the evaluation set covers multi-turn follow-ups.
+
 **Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, and `chars="start-end"` attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
 ### `POST /v1/embeddings`
@@ -435,6 +447,9 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `ENABLE_RAG` | `true` | global RAG switch |
 | `RAG_TOP_K` | `3` | default number of chunks in the context |
 | `RAG_MIN_SCORE` | `0.5` | default cosine-score threshold |
+| `RAG_QUERY_REWRITE` | `off` | follow-up query mode: `off`, `concat`, or `llm` |
+| `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
+| `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
 | `UPSTREAM_BASE_URL` | — | OpenAI-compatible server URL (`.../v1` or without) |
 | `UPSTREAM_API_KEY` | — | model-server key; empty = no header |
 | `UPSTREAM_HEADERS` | — | extra upstream headers as a JSON object |
@@ -605,7 +620,7 @@ Qwen3-Embedding-0.6B is noticeably slower on CPU than 300M models, but backgroun
 - **No reranker** — the top-`k` dense results go straight into the prompt.
 - **Heuristic chunking** — Markdown ATX headings and blank-line paragraphs only; setext headings and other markup are treated as plain text.
 - **Single GPU service** — bulk indexing and user queries compete for the same model; there is no dynamic batching (each request calls `model.encode` in a worker thread).
-- **Multi-turn follow-ups** — only the last user message is embedded, so elliptical questions ("what about the second one?") retrieve poorly.
+- **Multi-turn follow-ups** — supported via `RAG_QUERY_REWRITE=concat|llm`, but disabled by default until the evaluation set covers follow-ups.
 - **Text only** — only UTF-8 text files are supported; no PDF/DOCX parsing.
 - **Model-dependent threshold** — `RAG_MIN_SCORE` must be re-tuned after changing the embedding model.
 
