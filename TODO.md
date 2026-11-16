@@ -250,7 +250,7 @@ Single-turn non-regression is measured, not assumed: 60 single-turn questions th
 
 **Notes:** this is a breaking collection change; plan a re-index window. Keep the dense branch as a fallback if sparse vectors are missing.
 
-### [~] P2.2 Reliability: healthchecks, pinned versions, retries
+### [x] P2.2 Reliability: healthchecks, pinned versions, retries
 
 **Why:** Compose starts services before they are ready; `api` may still be downloading weights, and Qdrant was pulled as `latest`.
 
@@ -261,13 +261,22 @@ Single-turn non-regression is measured, not assumed: 60 single-turn questions th
 - [x] Add `depends_on` conditions: `api` and `embedder` wait for Qdrant; `embedder` waits for `api`; `gateway` starts early and degrades gracefully.
 - [x] Add retry/backoff around Qdrant connection setup in the indexer.
 - [x] Document the startup sequence and expected first-boot duration (~1.2 GB download + model load).
+- [x] Rehearse a Qdrant version change against the data the current stack wrote (`scripts/qdrant_upgrade_check.py`, volume copy + snapshot restore + self-vector query).
 
 **Acceptance criteria:**
-- Fresh `docker compose up` reaches a working state without a crash loop.
-- `docker compose ps` shows meaningful health states.
-- Upgrading Qdrant is a deliberate, tested action.
+- [x] Fresh `docker compose up` reaches a working state without a crash loop.
+- [x] `docker compose ps` shows meaningful health states.
+- [x] Upgrading Qdrant is a deliberate, tested action.
 
 **Notes:** implemented in `docker-compose.yaml` (`QDRANT_VERSION`, healthchecks, `depends_on`) and `embedder/main.py` (`wait_for_qdrant`). E2E verified live on this machine with the GPU stack: `docker compose up -d` reached a healthy state without a crash loop, `docker compose ps` showed `qdrant`, `api`, `gateway` healthy and `embedder` running, `api` logged `Startup complete`, `embedder` logged stale-vector reconciliation and the watcher (`Started watcher on /data/documents (debounce 1.0s)`), and `python scripts/smoke_test.py` passed all 5 checks against the gateway with a real LLM upstream. There was no `qdrant_data` on this machine, so there was no previously running tag to preserve; `v1.20.1` was the latest stable release at implementation time. Storage now lives on a named volume (see P2.3 notes).
+
+Version changes are rehearsed with `scripts/qdrant_upgrade_check.py` (stdlib only, docker CLI): it copies the compose volume (`rag_qdrant_data`) into a scratch volume, starts the target image on the copy, restores a snapshot into a fresh volume of the target image, compares `status` / `points` / `dim` / distinct `payload.file` and a self-vector query (one stored vector queried back, its own point must be the top hit) with the live collection, then removes the sandbox. The live stack keeps running and its volume is never written. Measured on this machine against the live collection (`green`, 202 points, dim 1024, 5 file paths):
+
+- `--image qdrant/qdrant:v1.20.1 --check volume` → `PASS`, numbers identical to the baseline, self-vector query score 1.0 (the pinned tag reads its own storage).
+- `--image qdrant/qdrant:latest --check volume` (that tag is Qdrant **1.15.5**, about 13 months older than the pinned tag) → `PASS`: `green`, 202 points, dim 1024, 5 files, self-vector query score 1.0, no warnings in the container log. So for this schema (one dense cosine vector, no quantization, no sparse vectors, plain payload indexes) the older server opened storage written by `v1.20.1`. This is not a general guarantee for other schemas, so the check must be re-run before any bump.
+- `--image qdrant/qdrant:latest --check restore --snapshot backups/documents-....snapshot` (3.9 MB, created by `v1.20.1` at 202 points) → `PASS`: the older server restored all 202 points, dim 1024, 5 file paths, self-vector query score 1.0. The snapshot is portable to that older version, which is what a rollback path needs.
+
+`tests/test_qdrant_upgrade_check.py` (14 tests) covers collection stats with scroll pagination, the self-vector query, the PASS/FAIL verdict, the compose volume name lookup, the readiness poll budget, and sandbox cleanup. A run interrupted by a timeout left a sandbox container behind, so `cleanup()` now runs at the start of every run, and the readiness poll uses a short timeout because a freshly published Docker port on Windows takes a while to accept a connection.
 
 ### [x] P2.3 Qdrant snapshots and restore — done, restore verified live
 

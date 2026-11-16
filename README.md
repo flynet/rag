@@ -99,6 +99,7 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 │   ├── eval_retrieval.py        # retrieval quality evaluation + top_k/min_score sweep
 │   ├── latency_probe.py         # p50/p95 of search while the indexer is busy
 │   ├── reconcile_check.py        # index vs watched folder: orphaned and un-indexed files
+│   ├── qdrant_upgrade_check.py   # rehearse a Qdrant version change on a volume copy
 │   └── qdrant_snapshot.py       # backup and restore of the Qdrant index
 ├── eval/
 │   ├── README.md                # dataset format, modes, sweep, metrics, tuning record
@@ -222,12 +223,45 @@ The upload endpoint (`POST /collections/documents/snapshots/upload`) verifies th
 
 Caveats:
 
-- **Version:** restore into the same Qdrant image version (the pinned `QDRANT_VERSION`); older servers cannot read storage written by newer ones.
+- **Version:** restore into the same Qdrant image version (the pinned `QDRANT_VERSION`). Storage and snapshots written by a newer server are not guaranteed to be readable by an older one; check the target version with `scripts/qdrant_upgrade_check.py` before changing it.
 - **Re-index comparison:** a snapshot restore takes seconds; a full re-index of a corpus costs one embedding pass over every chunk on GPU.
 - **After restore:** `embedder` re-verifies file signatures on startup, so unchanged files are not re-indexed. Files changed while the index was stale remain out of date; check `embedder` logs.
 - **Full-storage snapshots** (`POST /snapshots`, `GET /snapshots`) cover all collections at once; they are restored by starting Qdrant with the `--snapshot <path>` flag at boot, not through REST.
 - **Offline:** `embedder` and `api` must be stopped while restoring, and retrieval is unavailable during restore.
 - The script is stdlib-only (no extra dependencies) and needs only `6333` reachable.
+
+#### Upgrading the pinned Qdrant version
+
+The image is pinned (`QDRANT_VERSION`, default `v1.20.1`) and never tracks `latest`. Storage and
+snapshots are produced by the running server, so a version change is a deliberate, checked action.
+Check the target version against the data the current stack produced **before** changing anything:
+
+```bash
+# copies the live volume, starts the target image on the copy, restores a snapshot
+# into a fresh volume, compares both with the live collection, removes the sandbox
+python scripts/qdrant_upgrade_check.py --image qdrant/qdrant:<new> --check both \
+    --snapshot backups/<latest>.snapshot
+```
+
+It compares `status`, `points`, `dim`, the distinct `payload.file` values, and a self-vector query
+(one stored vector, queried back: the top hit must be the same point) against the live collection.
+The live stack keeps running and its volume is never written. `PASS` means the target version reads
+the current data; `FAIL` on `volume` means the upgrade needs a snapshot restore, `FAIL` on
+`restore` means the snapshot is not readable by that version.
+
+Then apply the change:
+
+```bash
+python scripts/qdrant_snapshot.py create                       # snapshot + downloaded copy
+# set QDRANT_VERSION in .env
+docker compose up -d --force-recreate qdrant                   # same volume, new image
+curl -s http://localhost:6333/collections/documents            # status=green, points and dim as expected
+python scripts/smoke_test.py                                   # retrieval path works
+```
+
+Rollback is the same action in the other direction: set `QDRANT_VERSION` back, recreate the
+container, and restore the downloaded snapshot if the newer version wrote storage the pinned one
+cannot read.
 
 #### Index integrity (watched folder vs index)
 
@@ -749,6 +783,7 @@ Code map:
 - `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, one keep-alive connection for the whole run
 - `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, and `chunks_added`
 - `scripts/reconcile_check.py` — compares the files under the watched folder with the `payload.file` values in Qdrant (`audit`), counts chunks per file (`count`), and checks whether a file is in the top hits of a query (`search --expect/--absent`); stdlib only
+- `scripts/qdrant_upgrade_check.py` — rehearses a Qdrant version change: copies the live volume to a scratch volume, starts the target image on it, restores a snapshot into a fresh volume, and compares `status`/`points`/`dim`/distinct `payload.file` plus a self-vector query with the live collection; stdlib only, the live volume is never written
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
 Unit tests for the evaluation math (matching, metrics, sweep grid, dataset and corpus validation) run without GPU, API, or Docker:
