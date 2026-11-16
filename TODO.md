@@ -104,7 +104,7 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 
 **Notes:** 60 questions in `eval/questions.jsonl` over the corpus committed in `eval/corpus/` (202 chunks: `README.md` 68, `TODO.md` 80, `env_example.txt` 40, `eval_README.md` 13, `example.txt` 1). Coverage: exact identifiers and env keys/defaults, versions, ports, hardware, chunking, snapshot and restore commands, health endpoints, roadmap item names, paraphrases, Russian and English, multi-chunk answers. Ground truth was verified twice: offline against `eval/corpus` (`--corpus`) and against the indexed chunks, so every `text_contains` needle exists in the collection. Baseline committed in `eval/baseline.json`: `recall@5=0.683`, `recall@10=0.800`, `MRR@10=0.414`, `nDCG@10=0.557`; recorded gates `--min-recall 0.70 --min-mrr 0.35`, verified by a gate run against the live stack. 12 of 60 questions have no expected hit in the top 10, and they concentrate on short table rows (`Current state`, config tables, troubleshooting) — direct evidence for P2.1 hybrid search and P0.3 tuning. Caveats: the corpus is self-referential (project docs and the env template), so real user documents and a held-out subset are still to be added.
 
-### [~] P0.2 Startup reconciliation of stale vectors
+### [x] P0.2 Startup reconciliation of stale vectors
 
 **Why:** files deleted or renamed while the stack was stopped leave their chunks in Qdrant and remain searchable. The startup scan only queues files that exist.
 
@@ -116,11 +116,17 @@ the engine at whole repositories. P0–P3 stay the quality/reliability spine tha
 - [x] Log a summary: `removed N orphaned files / M chunks`.
 
 **Acceptance criteria:**
-- Stop the stack, delete a file, start the stack: its chunks are gone from `/collection/sample` and from search results.
-- Rename a file while stopped: only the new path is searchable.
-- Unchanged files are not re-embedded.
+- [x] Stop the stack, delete a file, start the stack: its chunks are gone from `/collection/sample` and from search results.
+- [x] Rename a file while stopped: only the new path is searchable.
+- [x] Unchanged files are not re-embedded.
 
-**Notes:** implemented in `VectorDB.reconcile_files()` and called before the startup scan. Live evidence from the running stack: deleting a file logged `File disappeared (deleted?)` and `Deleted vectors for /data/documents/Text Document.txt`; a queued index job raced the delete and left one orphaned chunk, which was removed with a filtered `points/delete` (`points_count` 193 → 192). The delete-while-stopped acceptance run is still to be done, together with the rename case. Keep this O(number of distinct files); for very large collections, batch the scroll and avoid loading texts.
+**Notes:** implemented in `VectorDB.reconcile_files()`, called before the startup scan. The acceptance probes are committed as `scripts/reconcile_check.py` (`audit`, `count --file`, `search --query --expect --absent`), documented in the README. Runs on the live stack (5-file corpus, 202 chunks at baseline):
+
+- Delete while stopped: marker file indexed to 1 chunk, stack stopped, file deleted, stack started. Startup logged `Reconciling index with /data/documents...` and `Removed stale vectors for 2 file(s) (2 chunks)`. `count --file` for the deleted file returned 0, and `audit` reported `index matches the watched folder` (no `ORPHANED`).
+- Rename while stopped: `p02_check.txt` → `p02_check_v2.txt` with the stack down. After startup: `count` = 0 for the old path, 1 for the new path, `audit` matched 6 disk files against 6 indexed paths, and `search --expect p02_check_v2.txt --absent p02_check.txt` printed `OK` for both (the renamed chunk ranked first, score 0.885 in the earlier run). No duplicate paths.
+- No re-embedding of unchanged files: the same startup logged `Unchanged, skipping` for all untouched files and upserted only the renamed one; `points_count` stayed at the baseline.
+- Delete while running (watcher, as a control): `File disappeared (deleted?)` and `Deleted vectors for <path>`, count dropped to 0, `audit` back to a clean match.
+- `audit` paginates Qdrant scroll with `next_page_offset`; reading `next_offset` stops after the first page (100 points) and reports indexed files as `NOT INDEXED` — this was the bug found while writing the probe on a 203-point collection.
 
 ### [x] P0.3 Tune `RAG_TOP_K` / `RAG_MIN_SCORE`
 

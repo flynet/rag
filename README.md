@@ -98,6 +98,7 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 │   ├── smoke_test.py            # end-to-end API check
 │   ├── eval_retrieval.py        # retrieval quality evaluation + top_k/min_score sweep
 │   ├── latency_probe.py         # p50/p95 of search while the indexer is busy
+│   ├── reconcile_check.py        # index vs watched folder: orphaned and un-indexed files
 │   └── qdrant_snapshot.py       # backup and restore of the Qdrant index
 ├── eval/
 │   ├── README.md                # dataset format, modes, sweep, metrics, tuning record
@@ -227,6 +228,24 @@ Caveats:
 - **Full-storage snapshots** (`POST /snapshots`, `GET /snapshots`) cover all collections at once; they are restored by starting Qdrant with the `--snapshot <path>` flag at boot, not through REST.
 - **Offline:** `embedder` and `api` must be stopped while restoring, and retrieval is unavailable during restore.
 - The script is stdlib-only (no extra dependencies) and needs only `6333` reachable.
+
+#### Index integrity (watched folder vs index)
+
+The indexer deletes vectors when a file disappears, and on startup removes vectors of files that
+are no longer under `WATCH_PATH` (`deleted`/`renamed` while the stack was stopped), so the index
+and the folder stay in sync. To check that from the outside:
+
+```bash
+python scripts/reconcile_check.py audit                 # every file on disk is indexed, no orphaned paths
+python scripts/reconcile_check.py count --file NAME     # chunks stored for that file
+python scripts/reconcile_check.py search --query "text" --expect NAME --absent NAME
+```
+
+`audit` exits non-zero if any file on disk is not indexed (`NOT INDEXED`) or any indexed path no
+longer exists on disk (`ORPHANED`). `search --expect/--absent` checks whether a file appears in the
+top hits, which is how a delete or a rename is verified end to end. The container mount defines the
+indexed path: `./data` is mounted as `/data`, so `data/documents/report.md` is stored as
+`/data/documents/report.md` (`--documents` and `--prefix`).
 
 ### Startup order
 
@@ -729,6 +748,7 @@ Code map:
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
 - `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, one keep-alive connection for the whole run
 - `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, and `chunks_added`
+- `scripts/reconcile_check.py` — compares the files under the watched folder with the `payload.file` values in Qdrant (`audit`), counts chunks per file (`count`), and checks whether a file is in the top hits of a query (`search --expect/--absent`); stdlib only
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
 Unit tests for the evaluation math (matching, metrics, sweep grid, dataset and corpus validation) run without GPU, API, or Docker:
