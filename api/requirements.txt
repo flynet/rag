@@ -9,3 +9,6 @@ uvicorn[standard]>=0.29
 qdrant-client>=1.12
 numpy>=1.26
 pydantic>=2.6
+# BM25 sparse vectors (CPU ONNX, no torch). The query side uses term frequency
+# and the collection applies IDF, so the corpus statistics are exact.
+fastembed>=0.3.7

@@ -14,6 +14,7 @@ Public (gateway-facing) endpoints:
 import base64
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
 
@@ -21,6 +22,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
+from qdrant_client.models import SparseVector
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -28,7 +30,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("api")
 
-from embedder import Embedder
+from embedder import Embedder, SparseEmbedder  # noqa: E402
+from hybrid import (  # noqa: E402
+    DENSE_VECTOR,
+    SPARSE_VECTOR,
+    SEARCH_MODES,
+    apply_threshold,
+    filter_relative,
+    fuse,
+    normalize_hits,
+)
 
 # Model configuration: one model instance for the whole system (see README)
 MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-Embedding-0.6B")
@@ -50,14 +61,36 @@ EMBEDDING_QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", "query").strip
 # keeps VRAM and p95 latency predictable while indexing and chat share the model.
 EMBEDDING_MAX_CONCURRENCY = max(1, int(os.environ.get("EMBEDDING_MAX_CONCURRENCY", "1")))
 
+# BM25 sparse search (FastEmbed, CPU). The model is tiny and adds no GPU load.
+SPARSE_ENABLED = os.environ.get("SPARSE_ENABLED", "true").lower() in {"1", "true", "yes"}
+SPARSE_MODEL = os.environ.get("SPARSE_MODEL", "Qdrant/bm25")
+BM25_THREADS = int(os.environ.get("BM25_THREADS", "0")) or None
+
+# "hybrid" runs dense + BM25 and fuses with RRF; "dense" is the old behaviour.
+# A collection without sparse vectors always falls back to dense (see /search).
+SEARCH_MODE = os.environ.get("SEARCH_MODE", "hybrid").strip().lower()
+if SEARCH_MODE not in SEARCH_MODES:
+    log.warning("Unknown SEARCH_MODE %r, using 'hybrid'", SEARCH_MODE)
+    SEARCH_MODE = "hybrid"
+
+# Weight of the BM25 branch in RRF (the dense branch is fixed at 1.0). Below 1.0
+# a BM25-only hit cannot outrank a chunk the dense branch placed near the top.
+SPARSE_WEIGHT = float(os.environ.get("SPARSE_WEIGHT", "1.0"))
+
+# Drop BM25 hits below this fraction of the best BM25 score for the query. A weak
+# term overlap (one shared common word) is ranking noise; 0.0 keeps every sparse
+# hit.
+SPARSE_MIN_RELATIVE = float(os.environ.get("SPARSE_MIN_RELATIVE", "0.0"))
+
 # Global objects (initialized at startup)
 embedder = None
+sparse_embedder = None
 qdrant_client = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global embedder, qdrant_client
+    global embedder, sparse_embedder, qdrant_client
 
     log.info("Connecting to Qdrant at %s:%s", QDRANT_HOST, QDRANT_PORT)
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
@@ -74,7 +107,16 @@ async def lifespan(_: FastAPI):
         max_concurrency=EMBEDDING_MAX_CONCURRENCY,
     )
 
-    log.info("Startup complete")
+    if SPARSE_ENABLED:
+        try:
+            sparse_embedder = SparseEmbedder(SPARSE_MODEL, threads=BM25_THREADS)
+        except Exception as exc:  # noqa: BLE001 - dense search must keep working
+            log.error("BM25 model failed to load, search falls back to dense-only: %s", exc)
+            sparse_embedder = None
+    else:
+        log.info("BM25 sparse search is disabled (SPARSE_ENABLED=false)")
+
+    log.info("Startup complete (search mode: %s)", SEARCH_MODE)
     yield
 
 
@@ -97,10 +139,11 @@ def _collection_exists() -> bool:
         return False
 
 
-def _query(vector: List[float], limit: int, min_score: Optional[float]):
+def _query(vector: List[float], limit: int, min_score: Optional[float], using: Optional[str] = None):
     """Run a nearest-neighbour search across qdrant-client versions.
 
     `QdrantClient.search` was removed in favour of `query_points`; keep both.
+    `using` selects a named vector (`dense`), which the hybrid schema needs.
     """
     kwargs: Dict[str, Any] = {
         "collection_name": COLLECTION_NAME,
@@ -109,11 +152,74 @@ def _query(vector: List[float], limit: int, min_score: Optional[float]):
     }
     if min_score is not None:
         kwargs["score_threshold"] = min_score
+    if using:
+        kwargs["using"] = using
 
     query_points = getattr(qdrant_client, "query_points", None)
     if callable(query_points):
         return list(query_points(query=vector, **kwargs).points)
     return list(qdrant_client.search(query_vector=vector, **kwargs))
+
+
+def _query_sparse(sparse: Dict[str, Any], limit: int):
+    """BM25 sparse search: dot product of the query terms against stored weights."""
+    query_points = getattr(qdrant_client, "query_points", None)
+    if not callable(query_points):
+        return []
+    points = query_points(
+        query=SparseVector(indices=sparse["indices"], values=sparse["values"]),
+        collection_name=COLLECTION_NAME,
+        limit=limit,
+        using=SPARSE_VECTOR,
+        with_payload=True,
+    )
+    return list(points.points)
+
+
+# The schema decides what a request can do, and `POST /search` runs on every
+# request: reading it once per 10 seconds is enough to notice a re-index.
+SCHEMA_TTL = 10.0
+_schema_cache: Dict[str, Any] = {"names": {}, "checked": None}
+
+
+def _vector_names() -> Dict[str, str]:
+    """`{vector_name: "dense" | "sparse"}` of the collection, cached for `SCHEMA_TTL`.
+
+    A collection written before the hybrid schema has one unnamed vector, so it
+    has no `dense` name to query and no `bm25` sparse vector.
+    """
+    if _schema_cache["checked"] is not None and (time.monotonic() - _schema_cache["checked"]) < SCHEMA_TTL:
+        return _schema_cache["names"]
+
+    names: Dict[str, str] = {}
+    try:
+        info = qdrant_client.get_collection(COLLECTION_NAME)
+        vectors = info.config.params.vectors
+        if isinstance(vectors, dict):
+            names.update({key: "dense" for key in vectors})
+        sparse = info.config.params.sparse_vectors
+        if isinstance(sparse, dict):
+            names.update({key: "sparse" for key in sparse})
+    except Exception:  # Qdrant down / collection missing
+        names = {}
+
+    _schema_cache["names"] = names
+    _schema_cache["checked"] = time.monotonic()
+    return names
+
+
+def _sparse_available() -> bool:
+    """Does the collection carry `bm25` sparse vectors?"""
+    return _vector_names().get(SPARSE_VECTOR) == "sparse"
+
+
+def _dense_using() -> Optional[str]:
+    """The named dense vector, or `None` for a pre-hybrid collection.
+
+    A collection with one unnamed vector cannot be queried with
+    `using="dense"`, so the name is passed only when the schema has it.
+    """
+    return DENSE_VECTOR if _vector_names().get(DENSE_VECTOR) == "dense" else None
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +246,15 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=100)
     min_score: Optional[float] = None
+    # "hybrid" (dense + BM25, RRF) or "dense" (embeddings only). Falls back to
+    # dense when the collection has no sparse vectors.
+    mode: Optional[str] = None
+    # RRF weight of the BM25 branch (the dense branch is fixed at 1.0). Tuning
+    # knob for `scripts/eval_retrieval.py`; `SPARSE_WEIGHT` is the service default.
+    sparse_weight: Optional[float] = Field(default=None, ge=0.0, le=10.0)
+    # Keep BM25 hits within this fraction of the best BM25 score. Tuning knob for
+    # `scripts/eval_retrieval.py`; `SPARSE_MIN_RELATIVE` is the service default.
+    sparse_min_relative: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class SearchResult(BaseModel):
@@ -151,44 +266,95 @@ class SearchResult(BaseModel):
     section: Optional[str] = None
     char_start: Optional[int] = None
     char_end: Optional[int] = None
+    fusion_score: Optional[float] = None
+    match: Optional[str] = None
+
+
+def _result(payload: Dict[str, Any], score: float, fusion_score: Optional[float], match: Optional[str]):
+    return SearchResult(
+        score=float(score),
+        text=payload.get("text", ""),
+        file=payload.get("file", "unknown"),
+        chunk=payload.get("chunk", 0),
+        title=payload.get("title"),
+        section=payload.get("section"),
+        char_start=payload.get("char_start"),
+        char_end=payload.get("char_end"),
+        fusion_score=float(fusion_score) if fusion_score is not None else None,
+        match=match,
+    )
+
+
+def _search_dense(query_vector: List[float], request: SearchRequest) -> List[SearchResult]:
+    hits = _query(query_vector, request.top_k, request.min_score, using=_dense_using())
+    # Filter locally as well, so the /search contract does not depend on the backend
+    if request.min_score is not None:
+        hits = [hit for hit in hits if hit.score >= request.min_score]
+    return [_result(hit.payload or {}, hit.score, None, "dense") for hit in hits]
+
+
+async def _search_hybrid(query_vector: List[float], request: SearchRequest) -> List[SearchResult]:
+    # Each branch returns more candidates than `top_k`, so RRF has material to
+    # rank: a chunk ranked 12th by BM25 can enter the final top 8 once fused.
+    candidates = min(100, max(request.top_k, request.top_k * 2))
+
+    dense_hits = normalize_hits(
+        _query(query_vector, candidates, request.min_score, using=_dense_using())
+    )
+
+    sparse_query = (await sparse_embedder.embed_query([request.query]))[0]
+    ratio = request.sparse_min_relative if request.sparse_min_relative is not None else SPARSE_MIN_RELATIVE
+    sparse_hits = filter_relative(normalize_hits(_query_sparse(sparse_query, candidates)), ratio)
+
+    weight = request.sparse_weight if request.sparse_weight is not None else SPARSE_WEIGHT
+    fused = apply_threshold(
+        fuse(dense_hits, sparse_hits, request.top_k, sparse_weight=weight),
+        request.min_score,
+    )
+
+    results: List[SearchResult] = []
+    for hit in fused:
+        ranks = hit["ranks"]
+        match = "both" if "dense" in ranks and "sparse" in ranks else ("dense" if "dense" in ranks else "sparse")
+        # `score` stays a relevance number the gateway and the eval harness can
+        # filter on: cosine when the dense branch found the chunk, otherwise the
+        # BM25 weight of the exact-term match. `fusion_score` is the RRF rank
+        # score, which has no cosine meaning on its own.
+        score = hit["dense_score"] if hit["dense_score"] is not None else hit["sparse_score"]
+        results.append(_result(hit["payload"], score, hit["fusion_score"], match))
+
+    return results
 
 
 @app.post("/search", response_model=List[SearchResult])
 async def search(request: SearchRequest):
-    """Semantic search over the document collection."""
+    """Document search over the collection: dense, or dense + BM25 fused with RRF."""
     if not _collection_exists():
         return []
 
-    # 1. Encode the query with the model's retrieval instruction
-    #    (Qwen3-Embedding: prompt_name="query").
+    mode = (request.mode or SEARCH_MODE).strip().lower()
+    if mode not in SEARCH_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'mode' must be one of: {', '.join(SEARCH_MODES)}",
+        )
+
+    hybrid = mode == "hybrid"
+    if hybrid and sparse_embedder is None:
+        log.info("BM25 model is not loaded - dense-only search for this request")
+        hybrid = False
+    if hybrid and not _sparse_available():
+        log.info("Collection has no '%s' sparse vectors - dense-only search", SPARSE_VECTOR)
+        hybrid = False
+
+    # Encode the query with the model's retrieval instruction
+    # (Qwen3-Embedding: prompt_name="query").
     query_vectors = await _encode([request.query], query=True)
     query_vector = query_vectors[0].astype(float).tolist()
 
-    # 2. Search in Qdrant
-    hits = _query(query_vector, request.top_k, request.min_score)
-
-    # Filter locally as well, so the /search contract does not depend on the backend
-    if request.min_score is not None:
-        hits = [hit for hit in hits if hit.score >= request.min_score]
-
-    # 3. Build the response
-    response: List[SearchResult] = []
-    for hit in hits:
-        payload = hit.payload or {}
-        response.append(
-            SearchResult(
-                score=float(hit.score),
-                text=payload.get("text", ""),
-                file=payload.get("file", "unknown"),
-                chunk=payload.get("chunk", 0),
-                title=payload.get("title"),
-                section=payload.get("section"),
-                char_start=payload.get("char_start"),
-                char_end=payload.get("char_end"),
-            )
-        )
-
-    return response
+    if hybrid:
+        return await _search_hybrid(query_vector, request)
+    return _search_dense(query_vector, request)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,12 +381,19 @@ async def embed_texts(request: EmbedRequest):
     if not all(isinstance(text, str) for text in request.texts):
         raise HTTPException(status_code=400, detail="'texts' must contain only strings")
 
-    vectors = await _encode([text if text.strip() else " " for text in request.texts])
+    cleaned = [text if text.strip() else " " for text in request.texts]
+    vectors = await _encode(cleaned)
 
-    return {
+    body: Dict[str, Any] = {
         "dim": int(vectors.shape[1]),
         "vectors": vectors.astype(float).tolist(),
     }
+    if sparse_embedder is not None:
+        # BM25 weights per text, in the same order: the indexer stores them as
+        # the `bm25` named sparse vector of each chunk.
+        body["sparse"] = await sparse_embedder.embed(cleaned)
+
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +488,9 @@ async def health():
         "dim": getattr(embedder, "dim", None),
         "query_prompt": getattr(embedder, "query_prompt", EMBEDDING_QUERY_PROMPT),
         "max_concurrency": getattr(embedder, "max_concurrency", EMBEDDING_MAX_CONCURRENCY),
+        "sparse_enabled": sparse_embedder is not None,
+        "sparse_model": SPARSE_MODEL if sparse_embedder is not None else None,
+        "search_mode": SEARCH_MODE,
         "collection": COLLECTION_NAME,
         "collection_exists": collection_exists,
     }
@@ -329,13 +505,23 @@ async def collection_info():
 
         info = qdrant_client.get_collection(COLLECTION_NAME)
         vectors_config = info.config.params.vectors
+        if isinstance(vectors_config, dict):
+            dense = vectors_config.get(DENSE_VECTOR)
+            vector_size = getattr(dense, "size", None)
+            named = sorted(vectors_config)
+        else:
+            vector_size = getattr(vectors_config, "size", None)
+            named = []
 
+        sparse = info.config.params.sparse_vectors
         return {
             "collection_name": COLLECTION_NAME,
             "exists": True,
             "points_count": info.points_count,
             "status": str(info.status),
-            "vector_size": getattr(vectors_config, "size", None),
+            "vector_size": vector_size,
+            "vectors": named,
+            "sparse_vectors": sorted(sparse) if isinstance(sparse, dict) else [],
         }
     except Exception as exc:
         return {"error": str(exc), "collection_name": COLLECTION_NAME}

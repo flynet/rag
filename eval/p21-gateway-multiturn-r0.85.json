@@ -1,0 +1,380 @@
+{
+  "generated_at": "2026-11-16T02:11:14.464958+00:00",
+  "dataset": "eval\\questions.multiturn.jsonl",
+  "mode": "gateway",
+  "base_url": "http://localhost:8001",
+  "questions": 9,
+  "top_k": 20,
+  "recall@5": 0.5555555555555556,
+  "recall@10": 0.8888888888888888,
+  "mrr@10": 0.3502645502645503,
+  "ndcg@10": 0.6693838204466072,
+  "avg_candidates": 20.0,
+  "avg_latency_s": 4.128,
+  "p50_latency_s": 4.012,
+  "p95_latency_s": 5.006,
+  "results": [
+    {
+      "id": "mt-001",
+      "question": "and the min score?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "section": "--- RAG ---"
+        },
+        {
+          "file": "README.md",
+          "section": "Configuration > Gateway variables"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 4,
+      "first_relevant_score": 0.6553,
+      "latency_s": 5.006,
+      "scores": [
+        0.8306,
+        0.6103,
+        0.6608,
+        0.6553,
+        0.6405,
+        0.6342,
+        0.6295,
+        0.6204,
+        0.619,
+        0.6151,
+        0.6128,
+        0.6113,
+        0.6022,
+        0.6001,
+        0.5862,
+        0.5859,
+        0.5853,
+        0.5816,
+        0.5763,
+        0.5712
+      ]
+    },
+    {
+      "id": "mt-002",
+      "question": "what about into a fresh instance?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Backups and restore (snapshots)"
+        },
+        {
+          "file": "TODO.md",
+          "section": "P2.3 Qdrant snapshots and restore"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 1,
+      "first_relevant_score": 0.8037,
+      "latency_s": 4.007,
+      "scores": [
+        0.8037,
+        0.7267,
+        0.7642,
+        0.7487,
+        0.7453,
+        0.7332,
+        0.715,
+        0.7095,
+        0.6646,
+        0.6576,
+        0.6188,
+        0.6147,
+        0.5648,
+        0.5619,
+        0.5555,
+        0.5538,
+        0.5429,
+        0.5343,
+        0.5257,
+        0.5102
+      ]
+    },
+    {
+      "id": "mt-003",
+      "question": "Сколько измерений у её векторов?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Current state"
+        },
+        {
+          "file": "env_example.txt",
+          "section": "vector dimension changes"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 11,
+      "first_relevant_score": 0.5104,
+      "latency_s": 3.721,
+      "scores": [
+        0.5057,
+        0.5539,
+        0.5484,
+        8.6812,
+        0.5311,
+        0.5262,
+        0.5157,
+        0.5111,
+        0.5108,
+        0.5105,
+        0.5104,
+        0.5102,
+        0.5062,
+        0.5032,
+        0.5021,
+        0.5015,
+        0.5014,
+        0.4962,
+        0.4871,
+        0.4867
+      ]
+    },
+    {
+      "id": "mt-004",
+      "question": "how is the indexer fed?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Document indexing"
+        },
+        {
+          "file": "env_example.txt",
+          "section": "A single model instance is loaded"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 7,
+      "first_relevant_score": 0.5503,
+      "latency_s": 4.297,
+      "scores": [
+        0.5614,
+        0.5072,
+        0.5829,
+        0.5719,
+        0.5554,
+        0.5532,
+        0.5503,
+        0.5489,
+        0.5409,
+        0.5376,
+        0.5355,
+        0.5337,
+        0.5331,
+        0.5303,
+        0.5298,
+        0.5296,
+        0.5257,
+        0.5252,
+        0.5243,
+        0.517
+      ]
+    },
+    {
+      "id": "mt-005",
+      "question": "and the API port?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Quick start > Setup"
+        },
+        {
+          "file": "env_example.txt",
+          "section": "http://192.168.1.50:8000"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 7,
+      "first_relevant_score": 0.4762,
+      "latency_s": 3.75,
+      "scores": [
+        0.4203,
+        0.4307,
+        0.3951,
+        0.4871,
+        8.8265,
+        0.4773,
+        0.4762,
+        0.4633,
+        0.4387,
+        0.4371,
+        0.4323,
+        0.431,
+        0.421,
+        0.4185,
+        0.4142,
+        0.4124,
+        0.4111,
+        0.4041,
+        0.4029,
+        0.4022
+      ]
+    },
+    {
+      "id": "mt-006",
+      "question": "what is its status?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "section": "P2.1 Hybrid search: BM25 + dense with RRF"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 1,
+      "first_relevant_score": 0.7435,
+      "latency_s": 4.313,
+      "scores": [
+        0.7435,
+        0.5829,
+        0.6501,
+        0.5812,
+        0.5774,
+        0.5698,
+        0.5521,
+        0.5361,
+        0.5348,
+        0.5321,
+        0.5289,
+        0.5264,
+        0.5254,
+        0.5227,
+        0.5182,
+        0.5174,
+        0.5173,
+        0.5162,
+        0.5131,
+        0.513
+      ]
+    },
+    {
+      "id": "mt-007",
+      "question": "and what is the overlap?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Current state"
+        },
+        {
+          "file": "env_example.txt",
+          "section": "1024-character chunks"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 5,
+      "first_relevant_score": 0.4901,
+      "latency_s": 4.296,
+      "scores": [
+        0.4048,
+        0.5529,
+        0.5142,
+        0.4959,
+        0.4901,
+        0.4611,
+        0.4391,
+        0.4373,
+        0.4166,
+        0.4106,
+        0.3998,
+        0.3973,
+        0.3946,
+        0.3853,
+        0.384,
+        0.3834,
+        0.3816,
+        0.3815,
+        0.376,
+        0.3711
+      ]
+    },
+    {
+      "id": "mt-008",
+      "question": "and the evaluation?",
+      "expected": [
+        {
+          "file": "eval_README.md",
+          "section": "Retrieval evaluation > Running"
+        },
+        {
+          "file": "README.md",
+          "section": "Development"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 4,
+      "first_relevant_score": 0.5126,
+      "latency_s": 4.012,
+      "scores": [
+        0.4031,
+        0.5318,
+        0.524,
+        0.5126,
+        0.4784,
+        0.4652,
+        0.4638,
+        0.4629,
+        0.4585,
+        0.4579,
+        0.4433,
+        0.4366,
+        0.4295,
+        0.4207,
+        0.4204,
+        0.4098,
+        0.4094,
+        0.4025,
+        0.4006,
+        0.3995
+      ]
+    },
+    {
+      "id": "mt-009",
+      "question": "and the top k header?",
+      "expected": [
+        {
+          "file": "README.md",
+          "section": "Per-request RAG control"
+        },
+        {
+          "file": "README.md",
+          "section": "Configuration > Gateway variables"
+        }
+      ],
+      "returned": 20,
+      "first_rank": 6,
+      "first_relevant_score": 0.5445,
+      "latency_s": 3.748,
+      "scores": [
+        0.4946,
+        0.5703,
+        0.5497,
+        17.2234,
+        0.5446,
+        0.5445,
+        0.542,
+        0.5377,
+        0.5286,
+        0.5235,
+        0.5214,
+        0.5169,
+        0.5146,
+        0.5115,
+        0.5068,
+        0.5059,
+        0.5047,
+        0.5021,
+        0.5018,
+        0.5001
+      ]
+    }
+  ],
+  "gateway_defaults": {
+    "top_k": 8,
+    "min_score": 0.3,
+    "query_rewrite": "concat",
+    "rewrite_history": 3
+  }
+}

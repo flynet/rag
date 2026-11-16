@@ -134,6 +134,9 @@ Useful options:
 | `--sweep-min-score` | `0.3,0.4,0.5,0.6,off` | grid rows for `min_score` (`off` = no threshold) |
 | `--json-out` | — | write aggregates, per-question results and the sweep grid |
 | `--show-failures` | `20` | number of failing questions to print |
+| `--retrieval-mode` | — (`api` default) | `hybrid` or `dense`, sent as `mode` to `/search` (search mode only) |
+| `--sparse-weight` | — (`SPARSE_WEIGHT`) | RRF weight of the BM25 branch, sent to `/search` (search mode only) |
+| `--sparse-min-relative` | — (`SPARSE_MIN_RELATIVE`) | drop BM25 hits below this fraction of the best BM25 score (search mode only) |
 | `--min-recall` | — | exit 1 if `recall@max(recall-k)` is below the value |
 | `--min-mrr` | — | exit 1 if `MRR@10` is below the value |
 
@@ -162,6 +165,18 @@ query-side instruction is part of the configuration, so compare
 `EMBEDDING_QUERY_PROMPT=query` with `EMBEDDING_QUERY_PROMPT=` (two runs, with
 `docker compose up -d api` between them) and keep the value that wins.
 
+### Sweep for the hybrid branch
+
+The BM25 branch adds two ranking knobs that the `top_k` × `min_score` sweep does not
+cover, so they are measured with per-request overrides on `POST /search`:
+
+- `--sparse-weight` — the RRF weight of the BM25 branch (the dense branch is fixed at `1.0`). Above `1.0` an exact-term hit counts for more than a dense neighbour; below `1.0` a BM25-only hit cannot outrank a chunk the dense branch placed near the top.
+- `--sparse-min-relative` — a relative floor on the BM25 score: hits below this fraction of the best BM25 score for the query are dropped, which removes weak term overlap (one shared common word). `min_score` is never applied to BM25: it filters the dense cosine score, and a BM25-only hit has no cosine score, so it always passes.
+
+The gateway has no way to pass them, so a gateway run uses the service defaults (`SPARSE_WEIGHT`, `SPARSE_MIN_RELATIVE`), which are read when the container is created: a change needs `docker compose up -d --force-recreate api`, and `/health` reports the effective `search_mode`.
+
+The grid is in [`p21-sweep.md`](p21-sweep.md) with the file each number came from. Reading it: the floor matters more than the weight (`0.7` is the best recall@10), and `weight=1.5` buys MRR/nDCG at the cost of recall, so `1.0` stays the default. The follow-up set is the binding one: BM25 gains on long rewritten questions with many common terms (`mt-003`: rank 9 → 13), which is what the reranker (P1.1) is for.
+
 ### The tuning record
 
 The sweeps that produced the committed values are kept in the repository:
@@ -174,6 +189,7 @@ The sweeps that produced the committed values are kept in the repository:
 | `eval/multiturn-off.json` | 9 follow-up conversations, gateway, rewrite `off` | recall@5 `0.667`, recall@10 `0.778`, MRR@10 `0.277`, nDCG@10 `0.392` — 2 of 9 follow-ups have no expected hit in the top ten |
 | `eval/multiturn-gateway.json` + `eval/sweep-multiturn.md` | the same 9 conversations, rewrite `concat` (the shipped default) | recall@5 `0.778`, recall@10 `1.000`, MRR@10 `0.420`, nDCG@10 `0.770`; `min_score=0.3`: recall@8 `0.889`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `11%`; `0.6`: `67%` |
 | `eval/multiturn-llm.json` + `eval/sweep-multiturn-llm.md` | the same 9 conversations, rewrite `llm` | recall@5 `0.889`, recall@10 `1.000`, MRR@10 `0.514`, nDCG@10 `0.781`; `min_score=0.3`: recall@8 `1.000`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `22%` — the best ranking, at one extra upstream call per follow-up |
+| `eval/p21-sweep.md` + the `eval/p21-*.json` files | dense-only vs dense + BM25 (RRF), `SPARSE_WEIGHT` × `SPARSE_MIN_RELATIVE`, 60 single-turn (`/search`, top_k=10) and 9 follow-up (gateway, top_k=20) questions | selected `SPARSE_WEIGHT=1.0` / `SPARSE_MIN_RELATIVE=0.7`: single-turn recall@10 `0.883` (dense-only `0.800`), recall@5 `0.750`; gateway single-turn recall@10 `0.883`, MRR@10 `0.490`; follow-ups recall@10 `0.889` / MRR@10 `0.453` against dense-only `1.000` / `0.420` |
 
 `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` is the choice all the tables support, and the
 follow-up sweep (`eval/sweep-multiturn.md`) is the binding one for the threshold:
@@ -227,6 +243,29 @@ python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mo
     --json-out eval/multiturn-llm.json
 Remove-Item Env:RAG_QUERY_REWRITE
 docker compose up -d --force-recreate gateway   # back to the shipped default (concat)
+```
+
+The hybrid grid is measured per request, so one container serves the whole sweep:
+
+```powershell
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode search \
+    --retrieval-mode dense --top-k 10 --json-out eval/p21-search-dense.json
+foreach ($cfg in @("1.0:0.0","1.0:0.3","1.0:0.5","1.0:0.7","1.5:0.3","1.5:0.5")) {
+    $w, $r = $cfg -split ":"
+    python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode search \
+        --retrieval-mode hybrid --sparse-weight $w --sparse-min-relative $r \
+        --top-k 10 --json-out "eval/p21-search-hybrid-w$w-r$r.json"
+}
+# the gateway runs use the service defaults, so recreate `api` with the chosen values
+# committed file names: weight 1.0 / floor 0.0 is `p21-search-hybrid-plain.json`,
+# the selected weight 1.0 / floor 0.7 run is `p21-search-selected.json`
+$env:SPARSE_WEIGHT = "1.0"; $env:SPARSE_MIN_RELATIVE = "0.7"
+docker compose up -d --force-recreate api
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
+    --top-k 20 --corpus data/documents --json-out eval/p21-gateway-singleturn.json
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --top-k 20 --corpus data/documents --json-out eval/p21-gateway-multiturn.json
+Remove-Item Env:SPARSE_WEIGHT,Env:SPARSE_MIN_RELATIVE
 ```
 
 Each gateway run prints the mode it measured against

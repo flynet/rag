@@ -406,15 +406,23 @@ def _normalize_search_hit(hit: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def evaluate_search(session: Session, questions: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+def evaluate_search(session: Session, questions: List[Dict[str, Any]], top_k: int,
+                    retrieval_mode: Optional[str] = None,
+                    sparse_weight: Optional[float] = None,
+                    sparse_min_relative: Optional[float] = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     for question in questions:
         start = time.perf_counter()
-        payload, _ = session.post(
-            "/search",
-            {"query": question["question"], "top_k": top_k, "min_score": None},
-        )
+        request = {"query": question["question"], "top_k": top_k, "min_score": None}
+        if retrieval_mode:
+            # "hybrid" (dense + BM25, RRF) or "dense". Omitted = the api default.
+            request["mode"] = retrieval_mode
+        if sparse_weight is not None:
+            request["sparse_weight"] = sparse_weight
+        if sparse_min_relative is not None:
+            request["sparse_min_relative"] = sparse_min_relative
+        payload, _ = session.post("/search", request)
         latency = time.perf_counter() - start
         if not isinstance(payload, list):
             raise RuntimeError(
@@ -718,6 +726,12 @@ def main() -> int:
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="embedding API base URL")
     parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL, help="gateway base URL")
     parser.add_argument("--api-key", default="", help="bearer key for the gateway")
+    parser.add_argument("--retrieval-mode", choices=("hybrid", "dense"), default=None,
+                        help="send `mode` to /search; omitted = the api's SEARCH_MODE default")
+    parser.add_argument("--sparse-weight", type=float, default=None,
+                        help="RRF weight of the BM25 branch, sent to /search (tuning)")
+    parser.add_argument("--sparse-min-relative", type=float, default=None,
+                        help="drop BM25 hits below this fraction of the best BM25 score")
     parser.add_argument("--model", default=None, help="model id for gateway mode")
     parser.add_argument("--top-k", type=int, default=None,
                         help=f"candidates per question (default {DEFAULT_TOP_K} for search, "
@@ -784,7 +798,10 @@ def main() -> int:
             results = evaluate_gateway(session, args.api_key, model, questions, top_k,
                                        corpus_texts(corpus_dir) if corpus_dir else None)
         else:
-            results = evaluate_search(session, questions, top_k)
+            results = evaluate_search(
+                session, questions, top_k, args.retrieval_mode,
+                args.sparse_weight, args.sparse_min_relative,
+            )
     except HttpError as exc:
         print(f"HTTP {exc.status} from {base_url}: {exc.body}")
         return 1

@@ -48,6 +48,9 @@ services:
       - DEBOUNCE_SEC=1.0
       - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      # Stored in the payload signature: changing the BM25 model rebuilds the
+      # index, so it must match `SPARSE_MODEL` of `api`.
+      - SPARSE_MODEL=${SPARSE_MODEL:-Qdrant/bm25}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     mem_limit: 1g
 
@@ -88,6 +91,20 @@ services:
       # Input length limit in tokens (the model supports 32k; chunks and queries are shorter).
       - EMBEDDING_MAX_SEQ_LENGTH=${EMBEDDING_MAX_SEQ_LENGTH:-8192}
       - EMBEDDING_MODEL_NAME=rag-embeddings
+      # BM25 sparse vectors (FastEmbed, CPU). SPARSE_ENABLED=false keeps the
+      # stack dense-only; the collection then has no `bm25` sparse vectors.
+      - SPARSE_ENABLED=${SPARSE_ENABLED:-true}
+      - SPARSE_MODEL=${SPARSE_MODEL:-Qdrant/bm25}
+      - BM25_THREADS=${BM25_THREADS:-0}
+      # "hybrid" = dense + BM25 fused with RRF, "dense" = embeddings only.
+      - SEARCH_MODE=${SEARCH_MODE:-hybrid}
+      # BM25 branch weight in RRF (dense is fixed at 1.0) and the relative floor
+      # for BM25 scores: hits below `SPARSE_MIN_RELATIVE` of the best BM25 score
+      # for the query are dropped, so weak term overlap is not ranking noise.
+      # Measured on the eval set (see eval/README.md): 1.0 / 0.7 is the best
+      # single-turn recall@10 and the best multiturn compromise.
+      - SPARSE_WEIGHT=${SPARSE_WEIGHT:-1.0}
+      - SPARSE_MIN_RELATIVE=${SPARSE_MIN_RELATIVE:-0.7}
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - COLLECTION_NAME=documents

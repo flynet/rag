@@ -39,8 +39,9 @@ EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 QDRANT_READY_ATTEMPTS = int(os.environ.get("QDRANT_READY_ATTEMPTS", "60"))
 QDRANT_READY_DELAY = float(os.environ.get("QDRANT_READY_DELAY", "2.0"))
 
-# The model label is stored in the payload: changing it rebuilds the index
+# The model labels are stored in the payload: changing either rebuilds the index
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "unknown")
+SPARSE_MODEL = os.environ.get("SPARSE_MODEL", "Qdrant/bm25")
 
 
 # --- indexing signature ---
@@ -54,6 +55,7 @@ def file_signature(path: Path) -> Dict[str, Any]:
         "chunk_overlap": CHUNK_OVERLAP,
         "chunking_version": CHUNKER_VERSION,
         "model": EMBEDDING_MODEL,
+        "sparse_model": SPARSE_MODEL,
     }
 
 
@@ -194,7 +196,7 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                 # The document title is embedded with every chunk; the payload
                 # keeps the original chunk text and citation offsets.
                 embedding_inputs = [chunk.embedding_text(title) for chunk in chunks]
-                vectors = await embedder.embed(embedding_inputs)
+                vectors, sparse = await embedder.embed_with_sparse(embedding_inputs)
             except Exception as exc:
                 log.error("Embedding error for %s: %s", file_path, exc)
                 continue
@@ -205,6 +207,7 @@ async def ingestion_worker(queue: asyncio.Queue, embedder: RemoteEmbedder, vecto
                     chunks,
                     vectors,
                     meta={**signature, "title": title},
+                    sparse=sparse,
                 )
                 log.info("Upserted %d chunks for %s", len(chunks), file_path)
             except Exception as exc:
@@ -233,8 +236,14 @@ async def main():
     # Wait for the embedding service and create/migrate the collection
     log.info("Waiting for embedding service at %s", API_URL)
     dim = await embedder.wait_ready()
-    vector_db.ensure_collection(dim=dim)
-    log.info("Collection '%s' ready (dim=%d)", vector_db.collection_name, dim)
+    sparse_enabled = await embedder.sparse_enabled()
+    vector_db.ensure_collection(dim=dim, sparse_enabled=sparse_enabled)
+    log.info(
+        "Collection '%s' ready (dim=%d, bm25 sparse=%s)",
+        vector_db.collection_name,
+        dim,
+        "on" if sparse_enabled else "off",
+    )
 
     # Ensure watch path exists
     watch_path = Path(WATCH_PATH)

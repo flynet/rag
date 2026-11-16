@@ -167,7 +167,10 @@ model, chunking, or query-prompt change; the numbers are not transferable.
 **Why:** a cross-encoder reordering the top candidates usually gives the largest precision gain, especially for paraphrased or long queries.
 
 **Scope:**
-- [ ] Retrieve 30–50 candidates from Qdrant (dense), rerank them, pass 5–8 to the LLM.
+- [ ] Retrieve 30–50 candidates and rerank them, pass 5–8 to the LLM. The candidate
+  list is the **fused hybrid list** (`POST /search` requests `2 × top_k` candidates,
+  capped at 100), not dense-only: after P2.1 the items that push relevant chunks out
+  of the top 10 come from the BM25 branch.
 - [ ] Evaluate `Qwen3-Reranker-0.6B` and `BAAI/bge-reranker-v2-m3` (or `jina-reranker-v2-base-multilingual`).
 - [ ] Decide placement: inside `api` (same GPU, simplest) or a separate `reranker` service (isolated VRAM/latency).
 - [ ] Add a `/rerank` contract or a `rerank=true` flag on `/search`; keep the gateway backwards compatible.
@@ -179,7 +182,7 @@ model, chunking, or query-prompt change; the numbers are not transferable.
 - Search still works with the reranker disabled and when it is down.
 - VRAM fits alongside the embedding model on 8 GB.
 
-**Notes:** reranking 50 candidates with a 0.6B cross-encoder costs more than embedding one query; measure before enabling by default. Consider running the reranker on CPU if VRAM is tight.
+**Notes:** reranking 50 candidates with a 0.6B cross-encoder costs more than embedding one query; measure before enabling by default. Consider running the reranker on CPU if VRAM is tight. RRF is rank-based, so an intruder from the BM25 branch sits at a fixed high rank (16th with `top_k=8`), not just below the cut — a cross-encoder that re-scores content, not position, is what removes it. The measured case is `mt-003` in **P2.1**: dense rank 9, hybrid rank 13.
 
 ### [~] P1.2 Structure-aware chunking + citation metadata
 
@@ -231,24 +234,41 @@ Single-turn non-regression is measured, not assumed: 60 single-turn questions th
 
 ## P2 — Retrieval breadth and reliability
 
-### [ ] P2.1 Hybrid search: BM25 + dense with RRF
+### [x] P2.1 Hybrid search: BM25 + dense with RRF — done, measured gains, one multiturn recall loss
 
 **Why:** dense embeddings miss exact identifiers, product codes, and rare names; BM25 covers them.
 
 **Scope:**
-- [ ] Migrate the collection to named vectors: `dense` (1024) + `bm25` (sparse).
-- [ ] Compute sparse vectors with FastEmbed `Qdrant/bm25` (add the dependency to both services that write vectors).
-- [ ] Query with Qdrant `prefetch` for both branches and `FusionQuery(fusion=RRF)`.
+- [x] Migrate the collection to named vectors: `dense` (1024) + `bm25` (sparse).
+- [x] Compute sparse vectors with FastEmbed `Qdrant/bm25` (add the dependency to both services that write vectors).
+- [x] Query with Qdrant `prefetch` for both branches and `FusionQuery(fusion=RRF)`.
 - [ ] Apply workspace/collection/source/type filters to both branches (shared with P4.1).
-- [ ] Re-index the corpus; keep the model/chunker signature in the payload.
-- [ ] Evaluate on identifier-heavy questions vs dense-only.
+- [x] Re-index the corpus; keep the model/chunker signature in the payload.
+- [x] Evaluate on identifier-heavy questions vs dense-only.
 
 **Acceptance criteria:**
-- Exact-term questions improve on the evaluation set.
-- Dense-only quality does not regress for paraphrased questions.
-- Collection schema and re-index procedure are documented.
+- [x] Exact-term questions improve on the evaluation set.
+- [x] Dense-only quality does not regress for paraphrased questions.
+- [x] Collection schema and re-index procedure are documented.
 
 **Notes:** this is a breaking collection change; plan a re-index window. Keep the dense branch as a fallback if sparse vectors are missing.
+
+Implemented in `api/hybrid.py` (stdlib fusion), `api/main.py` (two Qdrant branches + `/embed` returns dense and BM25), `api/embedder.py` (`SparseEmbedder`), `embedder/vector_db.py` (named `dense` + sparse `bm25` with `modifier=IDF`, schema migration by recreating the collection), `embedder/embedder.py` (`embed_with_sparse`), `embedder/main.py` (`SPARSE_MODEL` in the file signature). The dependency lives where vectors are produced: `api/requirements.txt` has `fastembed>=0.3.7` (CPU ONNX); `embedder` receives BM25 vectors over `POST /embed`, so it still has no torch and no model. `SPARSE_WEIGHT`, `SPARSE_MIN_RELATIVE`, `SEARCH_MODE`, `SPARSE_ENABLED`, `SPARSE_MODEL`, `BM25_THREADS` are in `docker-compose.yaml` and `.env.example`.
+
+The planned Qdrant-side fusion (`prefetch` + `FusionQuery(fusion=RRF)`) was verified live on a throwaway collection (the client model is `Prefetch`, not `PrefetchQuery`; `Fusion.RRF` works with two prefetches, dense `score_threshold` works inside a prefetch) but is **not** what ships: RRF scores are rank-based, so a `min_score=0.3` threshold applied to a fused score means something different from 0.3 cosine. Fusion therefore runs in `api`: each branch is queried separately (`using="dense"`, `using="bm25"`), and `apply_threshold` filters on the dense cosine score of every fused hit, keeping BM25-only hits (they have no cosine score and are exactly the exact-identifier hits the dense branch misses). `POST /search` exposes `mode`, `sparse_weight`, `sparse_min_relative` for the harness; `score` in the response is the dense cosine when the dense branch found the chunk, otherwise the BM25 weight, and `fusion_score` is the RRF rank score.
+
+Measured on the live stack (202 points, 5 corpus files, dense `Qwen3-Embedding-0.6B` fp16 CUDA + FastEmbed `Qdrant/bm25`), 2026-11-16; the full grid with the source file of every number is [`eval/p21-sweep.md`](eval/p21-sweep.md), the runs are committed as `eval/p21-search-*.json` and `eval/p21-gateway-*.json`. Selected `SPARSE_WEIGHT=1.0`, `SPARSE_MIN_RELATIVE=0.7` (60 single-turn questions, `POST /search`, top_k=10, no threshold):
+
+| | recall@5 | recall@10 | MRR@10 | nDCG@10 | p95 |
+|---|---|---|---|---|---|
+| dense-only | 0.683 | 0.800 | 0.414 | 0.557 | 0.064 s |
+| hybrid (selected) | **0.750** | **0.883** | 0.478 | 0.644 | 0.100 s |
+
+Per question: 21 improved, 27 unchanged, 12 regressed; 8 questions dense-only missed entirely are inside the top 10 (`q-003`, `q-009`, `q-028`, `q-029`, `q-032`, `q-039`, `q-054`, `q-055`), 4 dense-only hits dropped out (`q-004` 5→out, `q-008` 9→out, `q-012` 5→out, `q-037` 1→out). Subset by ground-truth shape: exact identifiers / code-like strings (n=37) `0.811→0.838` recall@10 and `0.451→0.461` MRR@10; paraphrased questions (n=23) `0.783→0.913` recall@10 and `0.355→0.480` MRR@10 — so the paraphrase subset does not regress, it improves. The identifier subset gains less than expected because the corpus is 5 documentation files whose "identifiers" (`RAG_TOP_K`, `QDRANT_VERSION`, `mem_limit`) are dense-retrievable already; the sparse branch mostly re-orders them. A corpus with product codes and ticket IDs is where BM25 should dominate, and P1.2 (structure-aware chunking acceptance) plus P4.1 (workspaces) are the inputs for that. Through the gateway, 60 single-turn questions at top_k=20 with rewrite `concat`: recall@10 `0.800→0.883`, MRR@10 `0.414→0.490`.
+
+Follow-up questions are the cost: 9 conversations through the gateway, rewrite `concat`, top_k=20 — dense-only `recall@10 1.000` / `MRR@10 0.420`; selected hybrid `recall@10 0.889` / `MRR@10 0.453`. `mt-003` (a long rewritten follow-up) is pushed from rank 9 to 13 by BM25 term overlap with many chunks; `mt-009` improves 4→1 and `mt-004` 6→3, which is why MRR rises while recall@10 drops. A floor of 0.85 keeps recall@5 at 0.556 with MRR 0.350, and `SPARSE_WEIGHT=1.5` gives the same numbers as `1.0` on this set, so the floor is the knob that matters and 0.7 is the shipped compromise. The reranker (P1.1) is the intended fix for the long-rewritten follow-up case, and `llm` rewrite keeps `recall@10 1.000` with dense retrieval.
+
+`tests/test_hybrid.py` (23 tests: RRF math, tie-breaking, top_k limit, the relative floor, the threshold keeping BM25-only hits, `POST /embed` sparse alignment across batches, dense-only responses, mismatched sparse count as a hard error) and `tests/test_vector_db_schema.py` (12 tests: named-vector creation, legacy unnamed collection recreated, missing sparse vector recreated, BM25 disabled keeps a dense-only collection, dimension change recreated, both vectors written, dense-only upsert, sparse length mismatch, citation and signature payload, stable point ids) run stdlib-only with a stubbed `qdrant_client`: 123 tests pass. Re-index procedure: [`README.md`](README.md) → *Collection schema (named dense + BM25)*, with the snapshot-before / re-index / `reconcile_check.py audit` / dense-vs-hybrid eval sequence. The live collection is migrated and verified: `dense` dim 1024 + `bm25` with `modifier=idf`, 202 of 202 points carry a sparse vector, BM25 queries on `RAG_TOP_K`, `QDRANT_VERSION`, `pgvector`, `BM25` return the expected chunks, and an unrelated phrase returns 0 hits. The shared workspace/collection/source/type filters are not implemented (P4.1): the search path has no filters today, so the "both branches" requirement is recorded here and lands with P4.1.
 
 ### [x] P2.2 Reliability: healthchecks, pinned versions, retries
 

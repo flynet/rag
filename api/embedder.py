@@ -163,3 +163,63 @@ class Embedder:
     async def embed_query(self, texts: List[str]):
         """Encode queries with the model's query prompt (when it has one)."""
         return await self.embed(texts, prompt_name=self.query_prompt)
+
+
+def sparse_to_dict(vector):
+    """Turn a fastembed sparse vector into the dict Qdrant takes.
+
+    `{"indices": [int], "values": [float]}`; indices must be positive integers.
+    """
+    return {
+        "indices": [int(i) for i in vector.indices.tolist()],
+        "values": [float(v) for v in vector.values.tolist()],
+    }
+
+
+class SparseEmbedder:
+    """BM25 sparse vectors (FastEmbed, CPU ONNX - no torch, no CUDA).
+
+    expose:
+        async embed(list[str]) -> list[dict]        # document side, BM25 weights
+        async embed_query(list[str]) -> list[dict]  # query side, term frequency
+
+    The Qdrant BM25 recipe: documents carry BM25 term weights, queries carry raw
+    term frequency, and the collection's sparse index has `modifier=IDF`, so IDF
+    is computed from the real corpus (better than the static estimate fastembed
+    bakes into `embed()`).
+    """
+
+    def __init__(self, model_name: str = "Qdrant/bm25", threads: Optional[int] = None):
+        # Imported here so the dense path works when fastembed is not installed.
+        from fastembed import SparseTextEmbedding
+
+        self.model_name = model_name
+        log.info("Loading BM25 sparse model %s (CPU, threads=%s)", model_name, threads or "auto")
+        self.model = SparseTextEmbedding(model_name=model_name, threads=threads)
+        # Smoke test: one tiny encode confirms the ONNX session works.
+        probe = self.model.embed(["bm25 probe"])
+        sample = list(probe)[0]
+        log.info(
+            "BM25 model ready (%d terms in the probe text, term id space ~%d)",
+            len(sample.indices),
+            int(max(sample.indices)) if len(sample.indices) else 0,
+        )
+
+    def _encode_sync(self, texts: List[str], query: bool):
+        if query:
+            vectors = self.model.query_embed(texts)
+        else:
+            vectors = self.model.embed(texts)
+        return [sparse_to_dict(v) for v in vectors]
+
+    async def embed(self, texts: List[str]):
+        if not texts:
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._encode_sync, texts, False)
+
+    async def embed_query(self, texts: List[str]):
+        if not texts:
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._encode_sync, texts, True)

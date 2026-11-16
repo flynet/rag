@@ -16,6 +16,7 @@ There is no chat UI — the service exposes an API only. Any OpenAI-compatible c
 - OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/v1/embeddings`
 - Automatic document indexing: startup reconciliation, `watchdog` file monitoring, incremental updates (unchanged files are skipped by a stored signature)
 - Structure-aware chunking (Markdown headings → paragraphs → sentences, 1024-character chunks, 128-character overlap) with section paths and character offsets for citations
+- Hybrid retrieval: dense embeddings + BM25 sparse vectors fused with RRF, so exact identifiers, product codes and rare names are found (`SEARCH_MODE=dense` restores the embeddings-only behaviour)
 - RAG enabled by default: retrieved chunks are injected into the current user turn; retrieval is skipped inside agent tool loops
 - Per-request RAG control via `X-RAG-*` headers, sources returned in `X-RAG-Sources`
 - Follow-up query rewriting for short messages (`RAG_QUERY_REWRITE=off|concat|llm`, `concat` by default)
@@ -83,12 +84,13 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 │   ├── main.py                  # watcher, worker, incremental indexing
 │   ├── chunking.py              # structure-aware splitter + citation metadata
 │   ├── embedder.py              # HTTP client for api
-│   ├── vector_db.py             # Qdrant client wrapper
+│   ├── vector_db.py             # Qdrant client wrapper (named `dense` + `bm25` schema)
 │   └── requirements.txt
-├── api/                         # embeddings + search (owns the model)
+├── api/                         # embeddings + search (owns the models)
 │   ├── Dockerfile
 │   ├── main.py                  # /search, /embed, /v1/embeddings
-│   ├── embedder.py              # SentenceTransformer wrapper
+│   ├── embedder.py              # SentenceTransformer + FastEmbed BM25 wrappers
+│   ├── hybrid.py                # RRF fusion and the min_score rules (stdlib)
 │   └── requirements.txt
 ├── gateway/                     # public OpenAI-compatible gateway
 │   ├── Dockerfile
@@ -118,10 +120,15 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 │   ├── sweep-prompt-off.md      # the same grid without the query instruction
 │   ├── sweep-multiturn.md       # the same grid on follow-up conversations
 │   ├── sweep-multiturn-llm.md   # the same grid with the llm rewrite
+│   ├── p21-sweep.md             # hybrid (BM25) tuning grid: dense vs hybrid, weight, floor
 │   └── perf-probe.json          # measured search latency under ingest
 ├── tests/
-│   ├── test_eval_metrics.py     # unit tests for the eval math (no GPU/API needed)
-│   └── test_gateway_rewrite.py  # unit tests for follow-up query rewriting
+│   ├── test_eval_metrics.py       # unit tests for the eval math (no GPU/API needed)
+│   ├── test_gateway_rewrite.py    # unit tests for follow-up query rewriting
+│   ├── test_hybrid.py             # RRF fusion, thresholds, sparse wire format
+│   ├── test_vector_db_schema.py   # collection schema migration and upsert shape
+│   ├── test_reconcile_check.py    # unit tests for the index-vs-folder check
+│   └── test_qdrant_upgrade_check.py # unit tests for the version-change rehearsal
 ├── qdrant_snapshots/            # snapshots created on the Qdrant node (bind-mounted into the container)
 ├── backups/                     # downloaded Qdrant snapshots (created by the tool)
 ├── README.md
@@ -152,21 +159,21 @@ Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this re
 
 - **Port:** `8000` (debug only; agents use the gateway)
 - **Endpoints:**
-  - `POST /search` — semantic search (used by the gateway)
-  - `POST /embed` — internal batch endpoint for the indexer
+  - `POST /search` — hybrid retrieval: dense vector + BM25 sparse vector, fused with RRF (used by the gateway); `mode`/`sparse_weight`/`sparse_min_relative` are per-request overrides
+  - `POST /embed` — internal batch endpoint for the indexer (dense vectors + BM25 weights)
   - `POST /v1/embeddings` — OpenAI-compatible embeddings
-  - `GET /collection/info` — collection statistics
+  - `GET /collection/info` — collection statistics (named vectors, sparse vectors, points)
   - `GET /collection/sample` — sample points
-  - `GET /health` — model, device, dimension, and collection status
-- **Model:** loaded here and only here, fp16 on GPU
+  - `GET /health` — model, device, dimension, BM25 status, search mode, collection status
+- **Models:** the embedding model is loaded here and only here (fp16 on GPU); the BM25 model is a FastEmbed CPU model (~5 MB) in the same process
 - **Swagger:** http://localhost:8000/docs
 
 ### Embedder — indexing
 
 - Watches `./data/documents` (polling every second)
 - Splits text into chunks
-- Requests vectors from `api` (`POST /embed`) and writes them to Qdrant
-- Re-indexes only files whose signature changed (`mtime`, size, chunking config, model)
+- Requests dense vectors and BM25 weights from `api` (`POST /embed`) and writes both to Qdrant as the named vectors `dense` and `bm25`
+- Re-indexes only files whose signature changed (`mtime`, size, chunking config, dense model, BM25 model)
 - **GPU:** not required; the image is based on `python:3.10-slim` and has no torch/CUDA
 
 ### Qdrant — vector database
@@ -262,6 +269,42 @@ python scripts/smoke_test.py                                   # retrieval path 
 Rollback is the same action in the other direction: set `QDRANT_VERSION` back, recreate the
 container, and restore the downloaded snapshot if the newer version wrote storage the pinned one
 cannot read.
+
+#### Collection schema (named dense + BM25)
+
+Each point carries two vectors:
+
+| Name | Type | Written by | What it matches |
+|---|---|---|---|
+| `dense` | 1024-dim cosine vector | `Qwen/Qwen3-Embedding-0.6B` (GPU, in `api`) | meaning, paraphrase, multilingual similarity |
+| `bm25` | sparse vector, `modifier=IDF` | FastEmbed `Qdrant/bm25` (CPU, in `api`) | exact terms: identifiers, product codes, rare names |
+
+`POST /embed` returns both in one response (dense vectors and BM25 weights, aligned with the
+input texts) and the indexer writes them as the named vectors of one point. `POST /search`
+queries each branch by name (`using="dense"` / `using="bm25"`) and merges the two lists with RRF
+in `api/hybrid.py`; the collection's sparse index applies IDF, so BM25 term weights use the real
+corpus statistics.
+
+Moving from the pre-hybrid collection (one unnamed vector) to this schema is a breaking change:
+`ensure_collection` detects the mismatch, drops the collection, and the startup scan re-indexes
+every watched file, because the documents on disk are the source of truth. Snapshot first so the
+rollback is a restore, not a re-embedding:
+
+```bash
+python scripts/qdrant_snapshot.py create                       # snapshot of the current collection
+docker compose up -d --force-recreate api embedder             # BM25 loads, collection is recreated
+docker compose logs -f embedder                                # full re-index: one line per file
+python scripts/reconcile_check.py audit                        # every file on disk is indexed
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode search \
+    --retrieval-mode dense --top-k 10                          # dense-only reference
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode search --top-k 10
+```
+
+The dense branch is the fallback in both directions: `SPARSE_ENABLED=false`, a BM25 model that
+fails to load, or a collection without `bm25` vectors all give dense-only search (`/health`
+reports `sparse_enabled`, `SEARCH_MODE=dense` disables the sparse branch for every request). A
+chunk without a sparse vector is found by semantic search and not by exact-term search, which is
+the intended degradation: indexing never stops because BM25 is unavailable.
 
 #### Index integrity (watched folder vs index)
 
@@ -539,6 +582,32 @@ Public, no authentication. Checks the model server and the `api` service.
 
 `status` is `degraded` when at least one dependency is unavailable. If `UPSTREAM_BASE_URL` is empty, `upstream.ok` is `false` and chat requests return `503`.
 
+### `POST /search` (internal, `api` on `:8000`)
+
+The gateway calls this endpoint; agents do not. The request and response are not OpenAI-compatible.
+
+```bash
+curl -X POST http://localhost:8000/search -H "Content-Type: application/json" \
+  -d '{"query": "RAG_TOP_K", "top_k": 8, "min_score": 0.3}'
+```
+
+```json
+[{"score": 0.55, "text": "...", "file": "/data/documents/README.md", "chunk": 12,
+  "title": "RAG Gateway", "section": "Configuration", "char_start": 5120, "char_end": 5980,
+  "fusion_score": 0.0227, "match": "both"}]
+```
+
+| Request field | Default | Meaning |
+|---|---|---|
+| `query` | — | the query text (encoded with the model's retrieval instruction) |
+| `top_k` | `5` | chunks to return, `1..100` |
+| `min_score` | `null` | threshold applied to the **dense cosine** score; BM25-only hits have no cosine score and always pass |
+| `mode` | `SEARCH_MODE` (`hybrid`) | `dense` runs embeddings only; `hybrid` runs both branches |
+| `sparse_weight` | `SPARSE_WEIGHT` | RRF weight of the BM25 branch, tuning knob |
+| `sparse_min_relative` | `SPARSE_MIN_RELATIVE` | drop BM25 hits below this fraction of the best BM25 score, tuning knob |
+
+`score` is a relevance number the gateway can filter on: the dense cosine when the dense branch found the chunk, otherwise the BM25 weight of the exact-term match. `fusion_score` is the RRF rank score, which has no cosine meaning on its own; `match` is `dense`, `sparse`, or `both`. `X-RAG-Sources` carries `score`, not `fusion_score`.
+
 ## Configuration
 
 Variables are read from `.env` (see [`.env.example`](.env.example)).
@@ -558,6 +627,11 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `ENABLE_RAG` | `true` | global RAG switch |
 | `RAG_TOP_K` | `8` | chunks injected into the prompt |
 | `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; model-dependent, re-tune after changing the model |
+| `SEARCH_MODE` | `hybrid` | `hybrid` (dense + BM25 fused with RRF) or `dense` (embeddings only) |
+| `SPARSE_ENABLED` | `true` | load the BM25 model; `false` means dense-only search and no `bm25` vectors in the collection |
+| `SPARSE_MODEL` | `Qdrant/bm25` | FastEmbed BM25 model id; part of the index signature, so changing it re-indexes every file |
+| `SPARSE_WEIGHT` | `1.0` | RRF weight of the BM25 branch (the dense branch is fixed at `1.0`); measured value, see [eval/p21-sweep.md](eval/p21-sweep.md) |
+| `SPARSE_MIN_RELATIVE` | `0.7` | drop BM25 hits below this fraction of the best BM25 score for the query; measured value, see [eval/p21-sweep.md](eval/p21-sweep.md) |
 | `RAG_QUERY_REWRITE` | `concat` | follow-up query mode: `off`, `concat`, or `llm` |
 | `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
 | `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
@@ -591,6 +665,7 @@ Set in `docker-compose.yaml`:
 | `EMBEDDING_MAX_CONCURRENCY` | `${EMBEDDING_MAX_CONCURRENCY}` = `1` | encode calls allowed at once; `1` serializes them on the GPU so indexing and chat queue instead of competing for VRAM |
 | `EMBEDDING_NORMALIZE` | `true` | L2-normalize output vectors |
 | `EMBEDDING_MODEL_NAME` | `rag-embeddings` | `model` field returned by `/v1/embeddings` |
+| `BM25_THREADS` | `0` (auto) | ONNX threads for the BM25 model; CPU only, no GPU load |
 | `MAX_BATCH_SIZE` | `256` | maximum texts per API request |
 | `QDRANT_HOST` / `QDRANT_PORT` | `qdrant` / `6333` | Qdrant location |
 | `COLLECTION_NAME` | `documents` | Qdrant collection |
@@ -608,7 +683,8 @@ Set in `docker-compose.yaml`:
 | `CHUNK_SIZE` | `1024` | chunk size in characters |
 | `CHUNK_OVERLAP` | `128` | overlap in characters |
 | `EMBED_BATCH_SIZE` | `32` | texts per `/embed` request |
-| `EMBEDDING_MODEL` | `unknown` (set by Compose) | model label stored in each chunk's signature |
+| `EMBEDDING_MODEL` | `unknown` (set by Compose) | dense model label stored in each chunk's signature |
+| `SPARSE_MODEL` | `Qdrant/bm25` (set by Compose) | BM25 model label stored in each chunk's signature; must match `SPARSE_MODEL` of `api` |
 
 ## Embedding model
 
@@ -646,6 +722,8 @@ EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 
 Changing the model invalidates the index because each chunk stores the model name in its payload. If the dimension changes (768 → 1024 when switching from embeddinggemma), the Qdrant collection is recreated automatically (`recreating the collection` in the log); if the dimension is the same, the collection is kept but all documents are still re-indexed. The full pass starts when `embedder` starts.
 
+Keep `SPARSE_MODEL` in sync between `api` and `embedder`: it is a label for the indexer and the model id for `api`, and a mismatch makes `embedder` re-index every file with the same BM25 vectors.
+
 Different models produce different cosine-score distributions, so `RAG_MIN_SCORE` and `RAG_TOP_K` must be re-measured after a switch, not copied. One retrieval pass plus the sweep grid is enough:
 
 ```bash
@@ -678,7 +756,7 @@ The indexer:
 5. splits changed files with the structure-aware chunker: Markdown ATX headings and blank-line paragraphs first, then sentences, then whitespace; chunks are capped at 1024 characters and overlap by up to 128;
 6. prepends the document title (first heading or first line) to each chunk before embedding;
 7. stores the original chunk text plus `title`, `section`, `char_start`, and `char_end` in the payload;
-8. deletes the file's old vectors and upserts the new ones.
+8. deletes the file's old vectors and upserts the new ones (dense vector + BM25 sparse vector).
 
 The chunker version is part of the file signature, so changing the splitting algorithm re-indexes existing documents. Character offsets refer to the normalized text (CRLF/CR converted to LF).
 
@@ -702,11 +780,12 @@ The layout targets a single machine with one GPU (tested on an RTX 4060 Laptop, 
 - **One model instance** — only `api` loads the weights; `embedder` requests vectors over HTTP and has no torch/CUDA. Host memory: `api` ≈ 1.5 GB (torch + CUDA) + Qwen3-Embedding-0.6B fp16 ≈ 1.2 GB, `qdrant` ≈ 0.2 GB.
 - **fp16** — half the weights and faster on tensor cores; on CPU, precision is forced to fp32.
 - **Vector normalization** (`EMBEDDING_NORMALIZE`, default `true`).
-- **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `chunking_version`, `model`); unchanged files are skipped at startup and on watcher events.
+- **Incremental indexing** — every chunk payload carries a file signature (`mtime`, `size`, `chunk_size`, `chunk_overlap`, `chunking_version`, dense model, BM25 model); unchanged files are skipped at startup and on watcher events.
 - **Batching** — texts are sent to `api` in `EMBED_BATCH_SIZE` batches.
 - **Memory limits** — `mem_limit` of 1 GB for `embedder` and 512 MB for `gateway`.
 - **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — less VRAM fragmentation.
 - **Serialized encode calls** (`EMBEDDING_MAX_CONCURRENCY=1`) — bulk indexing and chat queries queue instead of competing for VRAM.
+- **BM25 on CPU** — FastEmbed `Qdrant/bm25` is a term-weighting model (~5 MB, no neural network), so it adds no VRAM. The extra sparse encode and the second Qdrant query measured ~20–35 ms p95 on `POST /search` (`eval/p21-sweep.md`); gateway latency is dominated by the upstream LLM call.
 
 To free the GPU entirely, move embeddings to CPU:
 
@@ -773,12 +852,13 @@ docker compose restart gateway
 Code map:
 
 - `gateway/main.py` — `require_api_key`, `_rag_search`, `_inject_context`, `/v1/chat/completions`, `/v1/embeddings`
-- `api/main.py` — `/search` (Qdrant `query_points`, with a fallback to the older `search`) returning citation metadata, `/embed`, `/v1/embeddings`
-- `api/embedder.py` — `Embedder`: fp16 loading, batching, normalization, query prompt
-- `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature`
+- `api/main.py` — `/search` (dense + BM25 branches through Qdrant `query_points`, RRF fusion, citation metadata), `/embed` (dense vectors + BM25 weights), `/v1/embeddings`
+- `api/embedder.py` — `Embedder`: fp16 loading, batching, normalization, query prompt; `SparseEmbedder`: FastEmbed BM25 (CPU, document weights and query term frequency)
+- `api/hybrid.py` — `normalize_hits`, `fuse` (RRF with the BM25 weight), `filter_relative`, `apply_threshold` (the threshold applies to the dense cosine, BM25-only hits pass)
+- `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature` (mtime, size, chunking, dense model, BM25 model)
 - `embedder/chunking.py` — `split_text_into_chunks`, `TextChunk`, heading/section metadata and offsets
-- `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries and a readiness wait
-- `embedder/vector_db.py` — `VectorDB`: upsert with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`, collection recreation on dimension change
+- `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries, a readiness wait, and `embed_with_sparse` (dense + sparse, batch-aligned)
+- `embedder/vector_db.py` — `VectorDB`: `ensure_collection` (named `dense` + sparse `bm25`, schema migration by recreating the collection), upsert of both vectors with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
 - `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, one keep-alive connection for the whole run
 - `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, and `chunks_added`
@@ -786,7 +866,9 @@ Code map:
 - `scripts/qdrant_upgrade_check.py` — rehearses a Qdrant version change: copies the live volume to a scratch volume, starts the target image on it, restores a snapshot into a fresh volume, and compares `status`/`points`/`dim`/distinct `payload.file` plus a self-vector query with the live collection; stdlib only, the live volume is never written
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
-Unit tests for the evaluation math (matching, metrics, sweep grid, dataset and corpus validation) run without GPU, API, or Docker:
+Unit tests (fusion and threshold rules, the sparse wire format, collection-schema
+migration, evaluation math, gateway rewrite, snapshot and upgrade rehearsal, index
+reconciliation) run without GPU, API, or Docker:
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"

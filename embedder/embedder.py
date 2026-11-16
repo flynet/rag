@@ -8,7 +8,7 @@ torch, CUDA and the weights themselves.
 
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -42,6 +42,16 @@ class RemoteEmbedder:
             response = await client.get(f"{self.api_url}/health")
             response.raise_for_status()
             return response.json()
+
+    async def sparse_enabled(self) -> bool:
+        """Does `api` report a BM25 model? The collection schema depends on it."""
+        try:
+            payload = await self.health()
+        except Exception as exc:  # noqa: BLE001 - fall back to the default schema
+            log.warning("Could not read api /health, assuming BM25 is enabled: %s", exc)
+            return True
+        flag = payload.get("sparse_enabled")
+        return True if flag is None else bool(flag)
 
     async def wait_ready(self, attempts: int = 300, delay: float = 2.0) -> int:
         """Block until `api` reports a loaded model. Returns the vector dimension.
@@ -109,20 +119,40 @@ class RemoteEmbedder:
 
         raise RuntimeError(f"Embedding request failed after {self.retries} attempts: {last_error}")
 
-    async def embed(self, texts: List[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, self.dim or 0), dtype=np.float32)
+    async def embed_with_sparse(self, texts: List[str]):
+        """Dense vectors + BM25 sparse vectors, batch-aligned with `texts`.
 
-        batches = []
+        `api` returns `sparse` when its BM25 model is enabled. Responses without
+        it (BM25 disabled, or an older `api`) give an empty sparse list, and the
+        caller stores dense-only points: semantic search keeps working, exact-term
+        search does not.
+        """
+        if not texts:
+            return np.zeros((0, self.dim or 0), dtype=np.float32), []
+
+        dense_batches: List[np.ndarray] = []
+        sparse_batches: List[List[Dict[str, Any]]] = []
+
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start:start + self.batch_size]
             payload = await self._post("/embed", {"texts": batch})
 
             if payload.get("dim"):
                 self.dim = int(payload["dim"])
-            batches.append(np.asarray(payload.get("vectors") or [], dtype=np.float32))
+            dense_batches.append(np.asarray(payload.get("vectors") or [], dtype=np.float32))
+            sparse_batches.append(list(payload.get("sparse") or []))
 
-        if not batches:
-            return np.zeros((0, self.dim or 0), dtype=np.float32)
+        if not dense_batches:
+            return np.zeros((0, self.dim or 0), dtype=np.float32), []
 
-        return np.vstack(batches)
+        dense = np.vstack(dense_batches)
+        sparse = [item for batch in sparse_batches for item in batch]
+        if sparse and len(sparse) != len(texts):
+            raise RuntimeError(
+                f"api returned {len(sparse)} sparse vectors for {len(texts)} texts"
+            )
+        return dense, sparse
+
+    async def embed(self, texts: List[str]) -> np.ndarray:
+        dense, _ = await self.embed_with_sparse(texts)
+        return dense

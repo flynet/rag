@@ -1,0 +1,1578 @@
+{
+  "generated_at": "2026-11-16T01:38:14.534054+00:00",
+  "dataset": "eval\\questions.jsonl",
+  "mode": "search",
+  "base_url": "http://localhost:8000",
+  "questions": 60,
+  "top_k": 10,
+  "recall@5": 0.7333333333333333,
+  "recall@10": 0.8,
+  "mrr@10": 0.4857142857142857,
+  "ndcg@10": 0.6482110181014935,
+  "avg_candidates": 10.0,
+  "avg_latency_s": 0.413,
+  "p50_latency_s": 0.059,
+  "p95_latency_s": 0.084,
+  "results": [
+    {
+      "id": "q-001",
+      "question": "What is the default value of RAG_TOP_K?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "RAG_TOP_K=3"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 6,
+      "first_relevant_score": 0.6476,
+      "latency_s": 21.204,
+      "scores": [
+        0.7422,
+        0.6006,
+        0.5919,
+        0.5864,
+        0.6673,
+        0.6476,
+        0.6401,
+        0.6313,
+        0.6279,
+        0.5939
+      ]
+    },
+    {
+      "id": "q-002",
+      "question": "What is the default value of RAG_MIN_SCORE?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "RAG_MIN_SCORE=0.5"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 5,
+      "first_relevant_score": 0.6297,
+      "latency_s": 0.105,
+      "scores": [
+        0.7499,
+        0.5784,
+        0.5669,
+        0.5711,
+        0.6297,
+        0.6297,
+        0.623,
+        0.5963,
+        0.5955,
+        0.5867
+      ]
+    },
+    {
+      "id": "q-003",
+      "question": "Which GPU is the stack tested on?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "tested on RTX 4060 Laptop"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 5,
+      "first_relevant_score": 0.3452,
+      "latency_s": 0.057,
+      "scores": [
+        0.4307,
+        0.3647,
+        0.3871,
+        0.3868,
+        0.3452,
+        0.3288,
+        0.3312,
+        9.0195,
+        7.1574,
+        6.4464
+      ]
+    },
+    {
+      "id": "q-004",
+      "question": "Which embedding model does the stack use?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.077,
+      "scores": [
+        0.5692,
+        0.5405,
+        0.521,
+        0.5374,
+        0.5344,
+        0.5294,
+        0.5168,
+        8.6812,
+        7.3751,
+        7.2391
+      ]
+    },
+    {
+      "id": "q-005",
+      "question": "How many dimensions do the embedding vectors have?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "1024 dimensions"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.067,
+      "scores": [
+        0.5494,
+        0.5226,
+        0.497,
+        0.5851,
+        0.5086,
+        0.497,
+        9.1107,
+        8.2875,
+        8.1861,
+        6.6337
+      ]
+    },
+    {
+      "id": "q-006",
+      "question": "What is the vector dimension of the previous embeddinggemma-300m model?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "embeddinggemma-300m: 768"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.6649,
+      "latency_s": 0.054,
+      "scores": [
+        0.6649,
+        0.5857,
+        0.6087,
+        0.6099,
+        0.528,
+        12.7186,
+        8.9971,
+        0.6561,
+        0.6481,
+        0.6231
+      ]
+    },
+    {
+      "id": "q-007",
+      "question": "Which Qdrant version is pinned in the configuration?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "QDRANT_VERSION=v1.20.1"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.051,
+      "scores": [
+        0.6744,
+        0.6718,
+        0.6859,
+        0.5988,
+        0.6252,
+        11.3543,
+        9.5422,
+        8.854,
+        8.603,
+        7.1502
+      ]
+    },
+    {
+      "id": "q-008",
+      "question": "What chunk size and overlap does the chunker use?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "1024-character limit, 128-character overlap"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.084,
+      "scores": [
+        0.5856,
+        0.5579,
+        0.4355,
+        0.4284,
+        0.4668,
+        0.5291,
+        0.5206,
+        0.4935,
+        0.4689,
+        0.4553
+      ]
+    },
+    {
+      "id": "q-009",
+      "question": "Which port does the OpenAI-compatible gateway listen on?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "OPENAI_BASE_URL=http://localhost:8001/v1"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.5358,
+      "latency_s": 0.057,
+      "scores": [
+        0.5629,
+        0.5211,
+        0.5358,
+        9.0941,
+        7.4588,
+        0.6259,
+        0.5945,
+        0.57,
+        0.5688,
+        0.5634
+      ]
+    },
+    {
+      "id": "q-010",
+      "question": "What is the default embedding dtype?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBEDDING_DTYPE=float16"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.052,
+      "scores": [
+        0.4377,
+        0.4487,
+        0.4511,
+        0.4386,
+        5.2905,
+        4.8433,
+        4.8386,
+        4.8305,
+        4.6875,
+        4.5029
+      ]
+    },
+    {
+      "id": "q-011",
+      "question": "How many texts are sent in one embedding request?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBED_BATCH_SIZE=32"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.7318,
+      "latency_s": 0.051,
+      "scores": [
+        0.6188,
+        0.6807,
+        0.7318,
+        0.6406,
+        0.6012,
+        10.893,
+        10.0949,
+        9.5126,
+        9.2224,
+        7.9923
+      ]
+    },
+    {
+      "id": "q-012",
+      "question": "Which variable caps the number of tokens per embedded text?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBEDDING_MAX_SEQ_LENGTH=8192"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.067,
+      "scores": [
+        0.5533,
+        0.3848,
+        0.3802,
+        20.5232,
+        13.4688,
+        13.3872,
+        12.8342,
+        0.4768,
+        0.426,
+        0.4226
+      ]
+    },
+    {
+      "id": "q-013",
+      "question": "How do I disable gateway authentication?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "Leave empty to disable authentication"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.3576,
+      "latency_s": 0.072,
+      "scores": [
+        0.3801,
+        0.3576,
+        0.3198,
+        6.4659,
+        5.9938,
+        0.4611,
+        0.396,
+        0.3504,
+        0.3483,
+        0.3468
+      ]
+    },
+    {
+      "id": "q-014",
+      "question": "What is the default LLM generation timeout?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "UPSTREAM_TIMEOUT=600"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.687,
+      "latency_s": 0.068,
+      "scores": [
+        0.687,
+        0.5426,
+        0.4712,
+        0.4647,
+        0.5653,
+        0.556,
+        0.5299,
+        0.5088,
+        0.4901,
+        0.484
+      ]
+    },
+    {
+      "id": "q-015",
+      "question": "Is the trailing /v1 required in UPSTREAM_BASE_URL?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "With or without the trailing /v1 - both work:"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.5695,
+      "latency_s": 0.06,
+      "scores": [
+        0.5695,
+        0.6519,
+        0.3947,
+        0.3935,
+        7.2824,
+        0.5733,
+        0.5433,
+        0.4918,
+        0.472,
+        0.4685
+      ]
+    },
+    {
+      "id": "q-016",
+      "question": "Which request header turns RAG off for a single chat call?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Per-request RAG control"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.5794,
+      "latency_s": 0.049,
+      "scores": [
+        0.61,
+        0.5794,
+        0.6205,
+        0.5823,
+        0.5836,
+        16.3665,
+        11.4983,
+        11.3768,
+        10.6897,
+        0.643
+      ]
+    },
+    {
+      "id": "q-017",
+      "question": "Which response headers expose the retrieved passages?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Sources in the response"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.5433,
+      "latency_s": 0.052,
+      "scores": [
+        0.5433,
+        0.5705,
+        12.6564,
+        10.0623,
+        0.5137,
+        0.4901,
+        0.4797,
+        0.4732,
+        0.4644,
+        0.4615
+      ]
+    },
+    {
+      "id": "q-018",
+      "question": "How does the evaluation harness define recall@k?",
+      "expected": [
+        {
+          "file": "eval_README.md",
+          "text_contains": "fraction of questions with at least one relevant hit in the top"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.6323,
+      "latency_s": 0.063,
+      "scores": [
+        0.5938,
+        0.6323,
+        0.5718,
+        0.5885,
+        0.6321,
+        0.46,
+        0.5002,
+        0.4758,
+        0.4725,
+        12.8422
+      ]
+    },
+    {
+      "id": "q-019",
+      "question": "Which endpoint does the evaluation harness call?",
+      "expected": [
+        {
+          "file": "eval_README.md",
+          "text_contains": "embedding API"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.5655,
+      "latency_s": 0.053,
+      "scores": [
+        0.6029,
+        0.6444,
+        0.5655,
+        0.4778,
+        0.538,
+        0.5604,
+        0.4654,
+        8.1847,
+        7.5923,
+        7.0729
+      ]
+    },
+    {
+      "id": "q-020",
+      "question": "Which ground-truth criterion stays stable when the chunker changes?",
+      "expected": [
+        {
+          "file": "eval_README.md",
+          "text_contains": "is usually the most stable criterion"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.5628,
+      "latency_s": 0.05,
+      "scores": [
+        0.5628,
+        0.5781,
+        0.4822,
+        0.4768,
+        0.4716,
+        0.4668,
+        0.4603,
+        0.4535,
+        0.4476,
+        0.4358
+      ]
+    },
+    {
+      "id": "q-021",
+      "question": "Where do I put files so that they get indexed automatically?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Watches `./data/documents`"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.059,
+      "scores": [
+        0.5921,
+        0.4427,
+        0.4674,
+        0.4388,
+        0.4337,
+        0.4344,
+        8.4713,
+        7.2024,
+        6.876,
+        6.2514
+      ]
+    },
+    {
+      "id": "q-022",
+      "question": "What happens to the index when I switch to a different embedding model?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "Changing it invalidates the index"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.056,
+      "scores": [
+        0.6328,
+        0.5726,
+        0.5775,
+        0.5772,
+        13.5396,
+        9.5846,
+        8.9346,
+        8.5845,
+        8.2682,
+        0.5849
+      ]
+    },
+    {
+      "id": "q-023",
+      "question": "How do I run embeddings on the CPU instead of the GPU?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "EMBEDDING_DEVICE=cpu"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.687,
+      "latency_s": 0.052,
+      "scores": [
+        0.687,
+        0.5613,
+        0.5807,
+        0.5574,
+        11.0231,
+        9.2252,
+        0.6644,
+        0.6576,
+        0.6155,
+        0.6148
+      ]
+    },
+    {
+      "id": "q-024",
+      "question": "Which setting reduces VRAM fragmentation?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.049,
+      "scores": [
+        0.3431,
+        19.2476,
+        0.4907,
+        0.4739,
+        0.3838,
+        0.3621,
+        0.3525,
+        0.3503,
+        0.3434,
+        0.3397
+      ]
+    },
+    {
+      "id": "q-025",
+      "question": "How do I restore a Qdrant snapshot from a backup file?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Restore replaces the collection data"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.7445,
+      "latency_s": 0.066,
+      "scores": [
+        0.7681,
+        0.7966,
+        0.7445,
+        0.7889,
+        0.7587,
+        0.8145,
+        0.7404,
+        0.6885,
+        0.742,
+        0.5929
+      ]
+    },
+    {
+      "id": "q-026",
+      "question": "Which Compose command destroys the Qdrant storage volume?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "removes the containers"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.7419,
+      "latency_s": 0.06,
+      "scores": [
+        0.7419,
+        0.676,
+        0.6174,
+        0.6411,
+        0.635,
+        0.6762,
+        0.6621,
+        0.6539,
+        0.6411,
+        0.6363
+      ]
+    },
+    {
+      "id": "q-027",
+      "question": "Is there a chat UI in the gateway?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "There is no chat UI"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.481,
+      "latency_s": 0.05,
+      "scores": [
+        0.481,
+        7.195,
+        0.491,
+        0.4909,
+        0.4861,
+        0.4781,
+        0.4727,
+        0.4662,
+        0.447,
+        0.4443
+      ]
+    },
+    {
+      "id": "q-028",
+      "question": "Does the gateway forward the upstream key to agents?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "the upstream key never leaves it"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.3878,
+      "latency_s": 0.053,
+      "scores": [
+        0.6402,
+        0.4568,
+        0.3878,
+        14.9202,
+        0.5489,
+        0.5069,
+        0.48,
+        0.4353,
+        0.432,
+        0.4298
+      ]
+    },
+    {
+      "id": "q-029",
+      "question": "Does this stack include the generation model?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "The generation model is"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.3703,
+      "latency_s": 0.055,
+      "scores": [
+        0.3703,
+        0.3721,
+        0.3737,
+        9.8478,
+        7.7204,
+        6.3808,
+        5.5181,
+        0.4288,
+        0.427,
+        0.4192
+      ]
+    },
+    {
+      "id": "q-030",
+      "question": "Which service starts first in Compose?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Compose starts Qdrant, then"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.4121,
+      "latency_s": 0.055,
+      "scores": [
+        0.4202,
+        0.4121,
+        0.4301,
+        0.4079,
+        0.4196,
+        12.6496,
+        10.49,
+        9.1561,
+        7.8101,
+        7.3603
+      ]
+    },
+    {
+      "id": "q-031",
+      "question": "Why does the Qdrant healthcheck use a TCP connection?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "the official image has no"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.6374,
+      "latency_s": 0.069,
+      "scores": [
+        0.6446,
+        0.6374,
+        0.6149,
+        0.6063,
+        0.5979,
+        0.5603,
+        0.559,
+        0.5583,
+        0.5575,
+        0.5448
+      ]
+    },
+    {
+      "id": "q-032",
+      "question": "What memory limits are configured for the services?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "mem_limit"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 4,
+      "first_relevant_score": 8.3055,
+      "latency_s": 0.05,
+      "scores": [
+        0.4299,
+        0.3684,
+        8.3809,
+        8.3055,
+        7.9108,
+        7.742,
+        7.3983,
+        6.5272,
+        5.8313,
+        5.6247
+      ]
+    },
+    {
+      "id": "q-033",
+      "question": "Which library watches the documents folder?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "watchdog"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 10,
+      "first_relevant_score": 0.4376,
+      "latency_s": 0.06,
+      "scores": [
+        0.5148,
+        0.4457,
+        0.46,
+        0.3954,
+        7.5974,
+        7.3455,
+        0.5045,
+        0.4451,
+        0.4423,
+        0.4376
+      ]
+    },
+    {
+      "id": "q-034",
+      "question": "What does the gateway do when context is injected?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Context is injected only for a \"fresh\" user turn"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.4725,
+      "latency_s": 0.063,
+      "scores": [
+        0.6156,
+        0.4725,
+        0.4567,
+        0.4491,
+        0.4187,
+        0.4165,
+        9.7419,
+        6.6976,
+        4.9979,
+        0.4667
+      ]
+    },
+    {
+      "id": "q-035",
+      "question": "Какая модель используется для эмбеддингов?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.5641,
+      "latency_s": 0.055,
+      "scores": [
+        0.5764,
+        0.5641,
+        0.5573,
+        0.556,
+        0.5501,
+        0.5468,
+        0.5415,
+        0.5376,
+        0.5348,
+        0.5335
+      ]
+    },
+    {
+      "id": "q-036",
+      "question": "Сколько измерений у векторов эмбеддинга?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "Qwen3-Embedding-0.6B: 1024"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 7,
+      "first_relevant_score": 0.5156,
+      "latency_s": 0.066,
+      "scores": [
+        0.5784,
+        0.5422,
+        0.5413,
+        0.5264,
+        0.523,
+        0.5212,
+        0.5156,
+        0.515,
+        0.5103,
+        0.5096
+      ]
+    },
+    {
+      "id": "q-037",
+      "question": "Какая версия Qdrant зафиксирована?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "QDRANT_VERSION=v1.20.1"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.064,
+      "scores": [
+        0.6848,
+        0.6826,
+        0.6315,
+        0.6529,
+        0.6297,
+        0.6705,
+        0.6022,
+        0.6166,
+        0.6334,
+        0.6185
+      ]
+    },
+    {
+      "id": "q-038",
+      "question": "Как восстановить индекс из снапшота?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Restore replaces the collection data"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 4,
+      "first_relevant_score": 0.4533,
+      "latency_s": 0.049,
+      "scores": [
+        0.547,
+        0.5044,
+        0.4852,
+        0.4533,
+        0.451,
+        0.4483,
+        0.4477,
+        0.4305,
+        0.4213,
+        0.4082
+      ]
+    },
+    {
+      "id": "q-039",
+      "question": "Что делать при CUDA out of memory?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "the embedding model does not fit in VRAM"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 8.3883,
+      "latency_s": 0.054,
+      "scores": [
+        0.4469,
+        0.4723,
+        8.3883,
+        5.5682,
+        0.3886,
+        0.3748,
+        0.3683,
+        0.3676,
+        0.3649,
+        0.3646
+      ]
+    },
+    {
+      "id": "q-040",
+      "question": "Можно ли обходиться без GPU?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Qwen3-Embedding-0.6B is noticeably slower on CPU"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.384,
+      "latency_s": 0.053,
+      "scores": [
+        0.3634,
+        0.384,
+        0.3112,
+        0.3364,
+        0.289,
+        0.3178,
+        0.2815,
+        0.3045,
+        0.2854,
+        0.2709
+      ]
+    },
+    {
+      "id": "q-041",
+      "question": "Как часто embedder проверяет папку документов?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "polling every second"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 6,
+      "first_relevant_score": 0.4697,
+      "latency_s": 0.063,
+      "scores": [
+        0.5138,
+        0.4051,
+        0.4839,
+        0.4554,
+        0.4973,
+        0.4697,
+        3.6189,
+        3.5339,
+        3.4862,
+        3.4695
+      ]
+    },
+    {
+      "id": "q-042",
+      "question": "Можно ли использовать LM Studio как генерирующую модель?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "vLLM, LM Studio, llama.cpp"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.4165,
+      "latency_s": 0.053,
+      "scores": [
+        0.4101,
+        0.4165,
+        11.1938,
+        10.0217,
+        9.8161,
+        9.2273,
+        0.4465,
+        0.4336,
+        0.4089,
+        0.3819
+      ]
+    },
+    {
+      "id": "q-043",
+      "question": "Who is Alice Davince?",
+      "expected": [
+        {
+          "file": "example.txt",
+          "text_contains": "Alice Davince"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.6889,
+      "latency_s": 0.113,
+      "scores": [
+        0.6889,
+        14.6118,
+        0.238,
+        0.2369,
+        0.2365,
+        0.2362,
+        0.2358,
+        0.2341,
+        0.233,
+        0.2312
+      ]
+    },
+    {
+      "id": "q-044",
+      "question": "What makes a file get re-indexed?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "unchanged files are not re-indexed"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.4559,
+      "latency_s": 0.052,
+      "scores": [
+        0.5276,
+        0.5142,
+        0.4559,
+        10.0587,
+        8.4713,
+        7.2024,
+        6.876,
+        5.673,
+        0.5968,
+        0.5471
+      ]
+    },
+    {
+      "id": "q-045",
+      "question": "Which payload fields describe the chunk position in the document?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "stores the original chunk text"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.5143,
+      "latency_s": 0.057,
+      "scores": [
+        0.5143,
+        0.5981,
+        0.5455,
+        0.4115,
+        0.4667,
+        0.4087,
+        0.4342,
+        8.9009,
+        7.9055,
+        7.1623
+      ]
+    },
+    {
+      "id": "q-046",
+      "question": "What is the product direction of the project?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "Product direction — Local Knowledge Engine"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.3234,
+      "latency_s": 0.076,
+      "scores": [
+        0.3327,
+        0.3234,
+        0.3151,
+        0.2755,
+        10.4181,
+        0.3622,
+        0.3577,
+        0.3568,
+        0.3448,
+        0.319
+      ]
+    },
+    {
+      "id": "q-047",
+      "question": "Which roadmap item covers hybrid BM25 and dense search?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "P2.1 Hybrid search"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.7555,
+      "latency_s": 0.054,
+      "scores": [
+        0.7555,
+        0.5897,
+        0.5725,
+        0.5708,
+        14.0696,
+        0.6354,
+        0.5759,
+        0.5643,
+        0.5418,
+        0.5411
+      ]
+    },
+    {
+      "id": "q-048",
+      "question": "Which roadmap item is about Tree-sitter chunking by symbol units?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "P6.1 Tree-sitter chunking by symbol units"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.7462,
+      "latency_s": 0.066,
+      "scores": [
+        0.7462,
+        0.5375,
+        0.5572,
+        0.4941,
+        0.4827,
+        0.4823,
+        0.4813,
+        0.4794,
+        0.4551,
+        0.4439
+      ]
+    },
+    {
+      "id": "q-049",
+      "question": "Which roadmap item adds an MCP server with retrieval tools?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "P8.1 MCP server with retrieval tools"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.6858,
+      "latency_s": 0.062,
+      "scores": [
+        0.6858,
+        0.4476,
+        0.4113,
+        0.3974,
+        0.3965,
+        13.1797,
+        9.8665,
+        9.5957,
+        8.9875,
+        0.4572
+      ]
+    },
+    {
+      "id": "q-050",
+      "question": "What are the declared non-goals of the initial scope?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "Non-goals (initial scope)"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.3274,
+      "latency_s": 0.065,
+      "scores": [
+        0.3274,
+        0.3721,
+        0.3326,
+        0.3325,
+        0.3221,
+        0.3107,
+        0.3069,
+        0.296,
+        0.2891,
+        0.2867
+      ]
+    },
+    {
+      "id": "q-051",
+      "question": "Can a reranker fit alongside the embedding model?",
+      "expected": [
+        {
+          "file": "TODO.md",
+          "text_contains": "VRAM fits alongside the embedding model on 8 GB"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.6852,
+      "latency_s": 0.059,
+      "scores": [
+        0.6852,
+        0.6462,
+        0.6754,
+        0.5443,
+        0.5317,
+        0.5295,
+        0.5258,
+        0.5214,
+        0.5179,
+        0.5166
+      ]
+    },
+    {
+      "id": "q-052",
+      "question": "What is the current reranking support in the stack?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Reranking | None"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.4223,
+      "latency_s": 0.065,
+      "scores": [
+        0.4223,
+        0.4034,
+        0.4715,
+        0.497,
+        0.404,
+        8.9652,
+        6.8678,
+        6.6686,
+        5.7716,
+        5.3781
+      ]
+    },
+    {
+      "id": "q-053",
+      "question": "Is hybrid or sparse search implemented?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "Hybrid / sparse search | None"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 4,
+      "first_relevant_score": 0.4421,
+      "latency_s": 0.054,
+      "scores": [
+        0.5679,
+        0.4314,
+        0.591,
+        0.4421,
+        0.4296,
+        7.985,
+        0.4524,
+        0.4387,
+        0.4305,
+        0.4279
+      ]
+    },
+    {
+      "id": "q-054",
+      "question": "Which Python packages are pinned for the embedding model?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "transformers>=4.51"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 2,
+      "first_relevant_score": 0.5617,
+      "latency_s": 0.051,
+      "scores": [
+        0.631,
+        0.5617,
+        8.125,
+        7.8814,
+        7.3974,
+        6.4021,
+        6.1356,
+        5.9608,
+        5.8347,
+        5.5703
+      ]
+    },
+    {
+      "id": "q-055",
+      "question": "What does the gateway health endpoint report about the upstream?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "\"upstream\": {\"url\":"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 4,
+      "first_relevant_score": 13.071,
+      "latency_s": 0.079,
+      "scores": [
+        0.4278,
+        0.3604,
+        0.3661,
+        13.071,
+        10.3667,
+        8.9173,
+        8.7296,
+        6.7607,
+        0.5354,
+        0.4971
+      ]
+    },
+    {
+      "id": "q-056",
+      "question": "Which follow-up rewrite modes does the gateway support?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "off    - embed only the last user message (default)"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.065,
+      "scores": [
+        0.5471,
+        0.3993,
+        0.3731,
+        0.424,
+        0.4363,
+        0.3668,
+        0.3643,
+        12.5506,
+        11.4571,
+        8.5593
+      ]
+    },
+    {
+      "id": "q-057",
+      "question": "What is the query prompt used for Qwen3-Embedding?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "EMBEDDING_QUERY_PROMPT=query"
+        }
+      ],
+      "returned": 10,
+      "first_rank": null,
+      "first_relevant_score": null,
+      "latency_s": 0.054,
+      "scores": [
+        0.7079,
+        0.7575,
+        0.7051,
+        0.6419,
+        0.6545,
+        0.6495,
+        12.1242,
+        11.2189,
+        11.069,
+        0.7299
+      ]
+    },
+    {
+      "id": "q-058",
+      "question": "Что происходит с чанками файла, когда его удаляют из папки документов?",
+      "expected": [
+        {
+          "file": "README.md",
+          "text_contains": "deletes the file's old vectors"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 3,
+      "first_relevant_score": 0.4194,
+      "latency_s": 0.065,
+      "scores": [
+        0.4908,
+        0.4302,
+        0.4194,
+        0.4128,
+        0.3783,
+        0.356,
+        0.348,
+        0.3258,
+        0.3243,
+        0.3241
+      ]
+    },
+    {
+      "id": "q-059",
+      "question": "How many previous user turns are considered for a rewrite?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "RAG_REWRITE_HISTORY=3"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.4934,
+      "latency_s": 0.053,
+      "scores": [
+        0.4934,
+        0.5785,
+        0.4345,
+        0.4157,
+        0.4492,
+        0.379,
+        11.1261,
+        0.4633,
+        0.4621,
+        0.4349
+      ]
+    },
+    {
+      "id": "q-060",
+      "question": "Which service owns the single embedding model instance?",
+      "expected": [
+        {
+          "file": "env_example.txt",
+          "text_contains": "A single model instance is loaded (inside `api`)"
+        }
+      ],
+      "returned": 10,
+      "first_rank": 1,
+      "first_relevant_score": 0.6092,
+      "latency_s": 0.064,
+      "scores": [
+        0.6092,
+        0.5542,
+        0.5138,
+        0.5183,
+        0.4983,
+        13.2304,
+        11.304,
+        8.4095,
+        8.0644,
+        7.5768
+      ]
+    }
+  ]
+}

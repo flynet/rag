@@ -11,14 +11,24 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     FilterSelector,
+    KeywordIndexParams,
     MatchValue,
+    Modifier,
     PointStruct,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 
 from chunking import TextChunk
 
 log = logging.getLogger("embedder.db")
+
+# Named vectors: `dense` is the embedding model, `bm25` is the sparse BM25
+# representation. Named vectors are required for hybrid search, because a query
+# has to address each branch by name (`using="dense"` / `using="bm25"`).
+DENSE_VECTOR = "dense"
+SPARSE_VECTOR = "bm25"
 
 
 class VectorDB:
@@ -30,40 +40,97 @@ class VectorDB:
     # Collection
     # ------------------------------------------------------------------ #
 
-    def _collection_dim(self) -> Optional[int]:
+    def _collection_info(self):
         try:
-            info = self.client.get_collection(self.collection_name)
+            return self.client.get_collection(self.collection_name)
         except Exception:
             return None
-        return getattr(info.config.params.vectors, "size", None)
 
-    def ensure_collection(self, dim: int, distance: Distance = Distance.COSINE) -> None:
-        """Create the collection if it is missing; recreate it when the dimension changes."""
-        existing = self._collection_dim()
+    def _schema_ok(self, dim: int, sparse_enabled: bool) -> Tuple[bool, str]:
+        """Does the collection match the named-vector schema hybrid search needs?"""
+        info = self._collection_info()
+        if info is None:
+            return (False, "collection is missing")
 
-        if existing is None:
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(size=dim, distance=distance),
+        vectors = info.config.params.vectors
+        if not isinstance(vectors, dict):
+            return (False, "collection stores one unnamed vector (pre-hybrid schema)")
+
+        dense = vectors.get(DENSE_VECTOR)
+        if dense is None:
+            return (False, f"collection has no '{DENSE_VECTOR}' vector")
+
+        existing = getattr(dense, "size", None)
+        if existing != dim:
+            return (
+                False,
+                f"collection dense dim={existing} but the model produces dim={dim} "
+                "(EMBEDDING_MODEL changed?)",
             )
-            log.info("Created collection '%s' (dim=%d)", self.collection_name, dim)
+
+        if sparse_enabled:
+            sparse = info.config.params.sparse_vectors
+            if not isinstance(sparse, dict) or SPARSE_VECTOR not in sparse:
+                return (False, f"collection has no '{SPARSE_VECTOR}' sparse vector (hybrid schema)")
+
+        return (True, "ok")
+
+    def ensure_collection(
+        self,
+        dim: int,
+        sparse_enabled: bool = True,
+        distance: Distance = Distance.COSINE,
+    ) -> None:
+        """Create the collection, recreating it when the schema does not fit.
+
+        The pre-hybrid collection (one unnamed vector) cannot hold BM25 sparse
+        vectors, so switching to hybrid is a breaking change: the collection is
+        dropped and every watched file is re-indexed by the startup scan. The
+        source documents on disk are the source of truth, so that is safe; a
+        snapshot taken before the change (see `scripts/qdrant_snapshot.py`) is
+        the rollback path.
+        """
+        info = self._collection_info()
+        ok, reason = self._schema_ok(dim, sparse_enabled)
+        if ok:
             return
 
-        if existing != dim:
+        if info is not None:
             log.error(
-                "Collection '%s' uses dim=%s but the model produces dim=%d "
-                "(probably EMBEDDING_MODEL changed) - recreating the collection, "
-                "all documents will be re-indexed",
+                "Collection '%s' does not fit the hybrid schema: %s - recreating it, "
+                "all watched documents will be re-indexed",
                 self.collection_name,
-                existing,
-                dim,
+                reason,
             )
             self.client.delete_collection(self.collection_name)
-            self.client.create_collection(
+
+        sparse_config = (
+            {SPARSE_VECTOR: SparseVectorParams(modifier=Modifier.IDF)} if sparse_enabled else None
+        )
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config={DENSE_VECTOR: VectorParams(size=dim, distance=distance)},
+            sparse_vectors_config=sparse_config,
+        )
+        self._ensure_payload_index("file")
+        log.info(
+            "Created collection '%s' (named dense dim=%d, sparse=%s)",
+            self.collection_name,
+            dim,
+            SPARSE_VECTOR if sparse_enabled else "disabled",
+        )
+
+    def _ensure_payload_index(self, field: str) -> None:
+        """A keyword index on `field` so `file` / `section` filters are cheap."""
+        try:
+            self.client.create_payload_index(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(size=dim, distance=distance),
+                field_name=field,
+                field_schema=KeywordIndexParams(),
             )
-            log.info("Recreated collection '%s' (dim=%d)", self.collection_name, dim)
+        except Exception as exc:
+            # The index is an optimization; Qdrant filters correctly without it.
+            log.warning("Could not create a payload index on %r: %s", field, exc)
 
     # ------------------------------------------------------------------ #
     # Points
@@ -82,12 +149,19 @@ class VectorDB:
         chunks: List[TextChunk],
         vectors: np.ndarray,
         meta: Optional[Dict[str, Any]] = None,
+        sparse: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """upsert chunks->vectors. vectors: numpy array shape (n, dim)
 
         `meta` is copied into every payload so the indexer can later tell whether
         a file is still up to date (mtime/size/chunking config/model). Chunk
         metadata (section and character offsets) is stored alongside the text.
+
+        `sparse` is the per-chunk BM25 sparse vector, `{"indices":[...],
+        "values":[...]}`. When it is missing (an empty list: `api` has BM25
+        disabled), the point is written with the dense vector only: a chunk
+        without a sparse vector is found by semantic search but not by exact-term
+        search, which is the degradation the sparse branch is designed for.
         """
         if len(chunks) == 0:
             return
@@ -95,16 +169,28 @@ class VectorDB:
             raise ValueError(
                 f"Got {len(chunks)} chunks but {len(vectors)} vectors for {file_path}"
             )
+        # An empty `sparse` list means "no BM25 for this run", not a partial list,
+        # so it is not a length mismatch.
+        if sparse and len(sparse) != len(chunks):
+            raise ValueError(
+                f"Got {len(chunks)} chunks but {len(sparse)} sparse vectors for {file_path}"
+            )
 
         dim = vectors.shape[1]
+        sparse_enabled = bool(sparse)
         # ensure collection
-        self.ensure_collection(dim=dim)
+        self.ensure_collection(dim=dim, sparse_enabled=sparse_enabled)
 
         extra = dict(meta or {})
         points = []
         # Use hash-based integer ID
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
             pid = self._generate_id(file_path, i)
+            named = {DENSE_VECTOR: vec.tolist()}
+            if sparse_enabled and sparse[i]:
+                named[SPARSE_VECTOR] = SparseVector(
+                    indices=sparse[i]["indices"], values=sparse[i]["values"]
+                )
             points.append(
                 PointStruct(
                     id=pid,
@@ -117,7 +203,7 @@ class VectorDB:
                         "char_start": chunk.char_start,
                         "char_end": chunk.char_end,
                     },
-                    vector=vec.tolist(),
+                    vector=named,
                 )
             )
 
