@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-11-18T16:15:14.370934+00:00",
+  "api_url": "http://localhost:8000",
+  "docs_dir": "data\\documents",
+  "concurrency": 1,
+  "budget_seconds": 45.0,
+  "request_timeout": 15.0,
+  "phases": {
+    "encode_batch": {
+      "count": 2,
+      "p50": 0.10504980000041542,
+      "p95": 0.3042368999995233,
+      "p99": 0.3042368999995233,
+      "mean": 0.20464334999996936,
+      "batch_size": 32,
+      "budget_left": 29.56
+    },
+    "idle_rerank": {
+      "count": 3,
+      "p50": 0.8793473000005179,
+      "p95": 0.9876678000000538,
+      "p99": 0.9876678000000538,
+      "mean": 0.9108378000006875,
+      "budget_left": 25.97,
+      "mode": "rerank"
+    },
+    "idle_fused": {
+      "count": 3,
+      "p50": 0.08013460000074701,
+      "p95": 0.09435709999888786,
+      "p99": 0.09435709999888786,
+      "mean": 0.08278346666702419,
+      "budget_left": 25.64,
+      "mode": "fused"
+    },
+    "ingest": {
+      "count": 23,
+      "p50": 0.8562194000005547,
+      "p95": 1.0474710000016785,
+      "p99": 1.1893173000007664,
+      "mean": 0.871947526087198,
+      "budget_left": 5.58,
+      "mode": "rerank",
+      "chunks_added": 60,
+      "chunks_expected": 48,
+      "ingest_seconds": 20.0
+    },
+    "settled": {
+      "count": 3,
+      "p50": 0.8391043000010541,
+      "p95": 0.8642935999996553,
+      "p99": 0.8642935999996553,
+      "mean": 0.8133589000002152,
+      "budget_left": 3.12,
+      "mode": "rerank"
+    },
+    "settled_fused": {
+      "count": 3,
+      "p50": 0.049206099998627906,
+      "p95": 0.05183260000012524,
+      "p99": 0.05183260000012524,
+      "mean": 0.048374199999670964,
+      "budget_left": 2.98,
+      "mode": "fused"
+    }
+  },
+  "max_concurrency": 1,
+  "device": "cuda",
+  "dtype": "float16",
+  "rerank_enabled": true,
+  "rerank_model": "Qwen/Qwen3-Reranker-0.6B",
+  "rerank": "on",
+  "rerank_top_n": 30,
+  "warm_up_seconds": 0.86,
+  "primary_mode": "rerank",
+  "points_before": 202,
+  "budget_exceeded": false
+}

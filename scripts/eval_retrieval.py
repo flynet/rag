@@ -13,6 +13,10 @@ and nDCG@10. Two retrieval modes are supported:
 
 `--sweep` applies a `top_k` x `min_score` grid to the candidates already
 retrieved in one pass, so tuning does not cost one API run per configuration.
+`--rerank on` asks the cross-encoder to score the candidate pool, and
+`--sweep-rerank-top-n 30,50` runs one pass per pool, so the P1.1 sweep compares
+pool sizes against the unlabelled fused baseline. `--rerank off` forces
+reranking off, which measures on/off against one deployed configuration.
 `--corpus` validates the ground truth offline against the sample corpus, so a
 question set does not rot silently when the documents change. In gateway mode
 `--corpus` is also what makes `text_contains` usable: the harness slices the
@@ -31,6 +35,11 @@ Usage:
         --sweep --json-out eval/baseline.json
     python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
         --api-key sk-local --sweep
+    python scripts/eval_retrieval.py --questions eval/questions.jsonl \
+        --rerank on --rerank-top-n 30 --json-out eval/rerank-on.json
+    python scripts/eval_retrieval.py --questions eval/questions.jsonl --mode gateway \
+        --api-key sk-local --rerank on --sweep-rerank-top-n 30,50 \
+        --sweep --sweep-md eval/sweep-rerank.md --min-recall 0.70 --min-mrr 0.35
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 DEFAULT_QUESTIONS = Path("eval/questions.jsonl")
@@ -55,9 +64,12 @@ DEFAULT_GATEWAY_TOP_K = 20
 DEFAULT_RECALL_K = "5,10"
 DEFAULT_SWEEP_TOP_K = "3,5,8,10"
 DEFAULT_SWEEP_MIN_SCORE = "0.3,0.4,0.5,0.6,off"
+DEFAULT_SWEEP_RERANK_TOP_N = "30"
 
 # A threshold below every cosine score, i.e. "no threshold" for the gateway.
 NO_THRESHOLD = -1.0
+# The api's cap on rerank_top_n (RERANK_CANDIDATE_CAP), mirrored so the sweep asks for real values.
+MAX_RERANK_TOP_N = 100
 
 _ALLOWED_EXPECTED_FIELDS = {"file", "chunk", "text_contains", "section"}
 
@@ -346,8 +358,24 @@ def _is_relevant(hit: Dict[str, Any], relevant: List[Dict[str, Any]]) -> bool:
     return any(_matches(hit, expected) for expected in relevant)
 
 
+def rank_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The order the injected chunks appear in, as the gateway sends them.
+
+    Reranking orders candidates by `rerank_score` and `X-RAG-Sources` carries that
+    order, so a reranked pass has to be scored in it, not in the order the fused
+    list arrived in. A `None` rerank_score means reranking did not run, so the
+    returned order is kept; ties keep the returned order, the same rule
+    `api/rerank.py` applies, so the same request scored twice gives the same numbers.
+    """
+    if all(not isinstance(hit.get("rerank_score"), (int, float)) for hit in hits):
+        return list(hits)
+    return sorted(hits, key=lambda hit: (
+        hit["rerank_score"] if isinstance(hit.get("rerank_score"), (int, float)) else float("-inf"),
+    ), reverse=True)
+
+
 def _first_relevant_rank(hits: List[Dict[str, Any]], relevant: List[Dict[str, Any]]) -> Optional[int]:
-    for rank, hit in enumerate(hits, 1):
+    for rank, hit in enumerate(rank_hits(hits), 1):
         if _is_relevant(hit, relevant):
             return rank
     return None
@@ -355,7 +383,7 @@ def _first_relevant_rank(hits: List[Dict[str, Any]], relevant: List[Dict[str, An
 
 def _ndcg_at_k(hits: List[Dict[str, Any]], relevant: List[Dict[str, Any]], k: int) -> float:
     dcg = 0.0
-    for rank, hit in enumerate(hits[:k], 1):
+    for rank, hit in enumerate(rank_hits(hits)[:k], 1):
         if _is_relevant(hit, relevant):
             dcg += 1.0 / math.log2(rank + 1)
 
@@ -370,9 +398,10 @@ def score_metrics(hits: List[Dict[str, Any]], relevant: List[Dict[str, Any]],
 
     Candidates are cut at `top_k` first, then the score threshold removes hits
     below `min_score`, exactly like `POST /search` with `score_threshold` and the
-    gateway's own filter.
+    gateway's own filter. The order is the one `rank_hits` gives, so a reranked
+    pass is measured on the order the gateway would have injected.
     """
-    kept = [hit for hit in hits[:top_k] if float(hit.get("score", 0.0)) >= min_score]
+    kept = rank_hits([hit for hit in hits[:top_k] if float(hit.get("score", 0.0)) >= min_score])
     first_rank = None
     for rank, hit in enumerate(kept, 1):
         if _is_relevant(hit, relevant):
@@ -397,19 +426,36 @@ def _normalize_search_hit(hit: Any) -> Optional[Dict[str, Any]]:
     score = hit.get("score")
     if not isinstance(score, (int, float)):
         return None
+    rerank_score = hit.get("rerank_score")
+    if isinstance(rerank_score, (int, float)):
+        rerank_score = float(rerank_score)
+    else:
+        # Reranking did not run, or the api has no reranker loaded.
+        rerank_score = None
     return {
         "file": str(hit.get("file", "")),
         "chunk": int(hit.get("chunk", 0)),
         "text": str(hit.get("text", "")),
         "section": str(hit.get("section") or ""),
         "score": float(score),
+        "rerank_score": rerank_score,
     }
 
 
 def evaluate_search(session: Session, questions: List[Dict[str, Any]], top_k: int,
                     retrieval_mode: Optional[str] = None,
                     sparse_weight: Optional[float] = None,
-                    sparse_min_relative: Optional[float] = None) -> List[Dict[str, Any]]:
+                    sparse_min_relative: Optional[float] = None,
+                    rerank: Optional[bool] = None,
+                    rerank_top_n: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Retrieve through `POST /search`.
+
+    `rerank` is the per-request flag: `True` asks the api to score the candidate
+    pool with the cross-encoder, `False` forces reranking off for this request even
+    when `RERANK_ENABLED=true` on the service, `None` (the default) sends no field
+    and uses the service's configured default, so a baseline run is byte-identical
+    to a build without reranking. `rerank_top_n` is the pool the model sees.
+    """
     results: List[Dict[str, Any]] = []
 
     for question in questions:
@@ -422,6 +468,12 @@ def evaluate_search(session: Session, questions: List[Dict[str, Any]], top_k: in
             request["sparse_weight"] = sparse_weight
         if sparse_min_relative is not None:
             request["sparse_min_relative"] = sparse_min_relative
+        if rerank is not None:
+            # `false` is a real answer, not an absent field: it lets the harness
+            # compare on/off against one deployed configuration.
+            request["rerank"] = bool(rerank)
+        if rerank_top_n is not None:
+            request["rerank_top_n"] = int(rerank_top_n)
         payload, _ = session.post("/search", request)
         latency = time.perf_counter() - start
         if not isinstance(payload, list):
@@ -441,6 +493,7 @@ def _build_result(question: Dict[str, Any], hits: List[Dict[str, Any]],
     first_relevant_score = (
         round(hits[first_rank - 1]["score"], 4) if first_rank is not None else None
     )
+    scores = [hit["rerank_score"] for hit in hits if isinstance(hit.get("rerank_score"), (int, float))]
     return {
         "id": question["id"],
         "question": question["question"],
@@ -450,6 +503,11 @@ def _build_result(question: Dict[str, Any], hits: List[Dict[str, Any]],
         "first_relevant_score": first_relevant_score,
         "latency_s": round(latency, 3),
         "scores": [round(hit["score"], 4) for hit in hits],
+        # The reranker ran for this question when every returned hit carries a
+        # score. A fallback pass (load failure, timeout, bad score shape) returns
+        # the fused list with no scores, which must show up in the run record.
+        "reranked": bool(scores) and len(scores) == len(hits),
+        "rerank_scores": [round(score, 4) for score in scores],
         "hits": hits,
     }
 
@@ -491,7 +549,10 @@ def read_gateway_defaults(session: Session, api_key: str) -> Dict[str, Any]:
 
 def evaluate_gateway(session: Session, api_key: str, model: str,
                      questions: List[Dict[str, Any]], top_k: int,
-                     texts: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+                     texts: Optional[Dict[str, str]] = None,
+                     rerank: Optional[bool] = None,
+                     rerank_top_n: Optional[int] = None,
+                     rerank_query: Optional[str] = None) -> List[Dict[str, Any]]:
     """Retrieve through the gateway and read `X-RAG-Sources` from the response.
 
     The request carries the `history` turns plus the question, exactly as an agent
@@ -499,6 +560,12 @@ def evaluate_gateway(session: Session, api_key: str, model: str,
     part of what is measured. `X-RAG-TOP-K` is raised to the gateway cap and
     `X-RAG-MIN-SCORE` is disabled, so the sweep can apply any configuration
     offline to the raw candidate list.
+
+    `rerank` sends `X-RAG-RERANK: on|off` (omitted = the gateway's `RAG_RERANK`),
+    `rerank_top_n` sends `X-RAG-RERANK-TOP-N`, `rerank_query` sends
+    `X-RAG-RERANK-QUERY: retrieval|question` - which text the cross-encoder scores
+    the passages against. The sources header carries `rerank_score`, which is the
+    order the context block was built in.
 
     `texts` maps corpus file names to normalized text. The header has no chunk
     text, so each hit's text is sliced from the corpus by `char_start`/`char_end`;
@@ -511,6 +578,12 @@ def evaluate_gateway(session: Session, api_key: str, model: str,
         "X-RAG-TOP-K": str(top_k),
         "X-RAG-MIN-SCORE": str(NO_THRESHOLD),
     }
+    if rerank is not None:
+        headers["X-RAG-RERANK"] = "on" if rerank else "off"
+    if rerank_top_n is not None:
+        headers["X-RAG-RERANK-TOP-N"] = str(int(rerank_top_n))
+    if rerank_query is not None:
+        headers["X-RAG-RERANK-QUERY"] = rerank_query
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -536,12 +609,14 @@ def evaluate_gateway(session: Session, api_key: str, model: str,
             chunk_text = ""
             if normalized is not None and isinstance(start_offset, int) and isinstance(end_offset, int):
                 chunk_text = normalized[start_offset:end_offset]
+            rerank_score = hit.get("rerank_score")
             hits.append({
                 "file": str(hit.get("file", "")),
                 "chunk": int(hit.get("chunk", 0)),
                 "text": chunk_text,
                 "section": str(hit.get("section") or ""),
                 "score": float(hit.get("score", 0.0)),
+                "rerank_score": float(rerank_score) if isinstance(rerank_score, (int, float)) else None,
             })
         results.append(_build_result(question, hits, latency))
 
@@ -575,6 +650,7 @@ def summarise(results: List[Dict[str, Any]], recall_ks: List[int], top_k: int,
         _ndcg_at_k(result["hits"], result["expected"], 10) for result in results
     ) / total
     summary["avg_candidates"] = sum(result["returned"] for result in results) / total
+    summary["rerank_rate"] = sum(1 for result in results if result.get("reranked")) / total
     latencies = sorted(result["latency_s"] for result in results if result["latency_s"] is not None)
     if latencies:
         summary["avg_latency_s"] = round(sum(latencies) / len(latencies), 3)
@@ -584,29 +660,51 @@ def summarise(results: List[Dict[str, Any]], recall_ks: List[int], top_k: int,
     return summary
 
 
-def sweep(results: List[Dict[str, Any]], top_ks: List[int], min_scores: List[float]) -> Dict[str, Any]:
-    """Apply the (top_k, min_score) grid to the candidates of one retrieval pass."""
-    total = len(results)
-    grid: Dict[str, Any] = {"top_ks": top_ks, "min_scores": min_scores, "rows": []}
+def sweep(results: List[Dict[str, Any]], top_ks: List[int], min_scores: List[float],
+          rerank_top_ns: Sequence[int] = (None,)) -> Dict[str, Any]:
+    """Apply the (top_k, min_score) grid to the candidates of one retrieval pass.
 
-    for min_score in min_scores:
-        row: Dict[str, Any] = {"min_score": min_score}
-        for k in top_ks:
-            recall = 0.0
-            injected = 0.0
-            zero = 0
-            mrr = 0.0
-            for result in results:
-                metrics = score_metrics(result["hits"], result["expected"], k, min_score)
-                recall += metrics["recall"]
-                injected += metrics["injected"]
-                zero += metrics["zero_context"]
-                mrr += metrics["mrr"]
-            row[f"recall@{k}"] = recall / total
-            row[f"injected@{k}"] = injected / total
-            row[f"mrr@{k}"] = mrr / total
-            row[f"zero_context@{k}"] = zero / total
-        grid["rows"].append(row)
+    Each row is one (rerank_top_n, min_score) configuration: `top_k` cuts the
+    list, `min_score` drops hits below the threshold, `rerank_top_n` is the pool
+    the cross-encoder scored, so the P1.1 sweep is `30` against `50` against the
+    pool reranking was never asked for. `rerank_rate` in a row is the fraction of
+    questions that were actually reranked in that pass, so a pass where the model
+    failed to load is visible as a row of `off` numbers, not as a silent baseline.
+    """
+    grid: Dict[str, Any] = {
+        "top_ks": top_ks,
+        "min_scores": min_scores,
+        "rerank_top_ns": list(rerank_top_ns),
+        "rows": [],
+    }
+
+    for rerank_top_n in rerank_top_ns:
+        subset = [result for result in results if result.get("rerank_top_n") == rerank_top_n]
+        total = len(subset)
+        if not total:
+            continue
+        for min_score in min_scores:
+            row: Dict[str, Any] = {
+                "min_score": min_score,
+                "rerank_top_n": rerank_top_n,
+                "rerank_rate": sum(1 for result in subset if result.get("reranked")) / total,
+            }
+            for k in top_ks:
+                recall = 0.0
+                injected = 0.0
+                zero = 0
+                mrr = 0.0
+                for result in subset:
+                    metrics = score_metrics(result["hits"], result["expected"], k, min_score)
+                    recall += metrics["recall"]
+                    injected += metrics["injected"]
+                    zero += metrics["zero_context"]
+                    mrr += metrics["mrr"]
+                row[f"recall@{k}"] = recall / total
+                row[f"injected@{k}"] = injected / total
+                row[f"mrr@{k}"] = mrr / total
+                row[f"zero_context@{k}"] = zero / total
+            grid["rows"].append(row)
 
     return grid
 
@@ -643,6 +741,19 @@ def print_report(summary: Dict[str, Any], results: List[Dict[str, Any]],
             print(f"    expected: {json.dumps(result['expected'], ensure_ascii=False)}")
 
 
+def _row_label(row: Dict[str, Any]) -> str:
+    """The row label: `min_score`, plus the rerank pool when the grid has that axis.
+
+    With two pools in the grid the same `min_score` appears twice, so the label
+    has to say which pool the cross-encoder scored. `off` means reranking was not
+    asked for, and a pool with `rerank_rate=0` in the row means the model was asked
+    for and did not run, so the numbers are the fused baseline.
+    """
+    score = "off" if row["min_score"] <= NO_THRESHOLD else f"{row['min_score']:.2f}"
+    pool = row.get("rerank_top_n")
+    return score if pool is None else f"{score} rerank={pool}"
+
+
 def print_sweep(grid: Dict[str, Any], top_ks: List[int]) -> None:
     """Print recall, injected-context, and zero-context tables for the grid."""
     blocks = (
@@ -653,13 +764,13 @@ def print_sweep(grid: Dict[str, Any], top_ks: List[int]) -> None:
     print()
     for metric, title in blocks:
         print(title)
-        header = "min_score " + " ".join(f"{f'{metric}@{k}':>12}" for k in top_ks)
+        header = "config " + " ".join(f"{f'{metric}@{k}':>12}" for k in top_ks)
         print(header)
         print("-" * len(header))
         for row in grid["rows"]:
-            label = "off" if row["min_score"] <= NO_THRESHOLD else f"{row['min_score']:.2f}"
+            label = _row_label(row)
             cells = " ".join(f"{row[f'{metric}@{k}']:>12.3f}" for k in top_ks)
-            print(f"{label:>9}    {cells}")
+            print(f"{label:>18}    {cells}")
         print()
 
 
@@ -682,6 +793,11 @@ def sweep_markdown(grid: Dict[str, Any], top_ks: List[int], generated_at: str, m
         "`score_threshold` and the gateway apply them. All numbers are averages over the",
         "questions of the dataset.",
         "",
+        "Rows labelled `rerank=N` are a pass that asked the cross-encoder to score a pool of",
+        "`N` candidates and ranked the injected chunks by `rerank_score`; unlabelled rows use",
+        "the fused order. A `rerank=N` row whose reranker did not run (`rerank_rate=0` in the",
+        "JSON) is the fused baseline: the reranker is never a hard dependency.",
+        "",
     ]
     for metric, title in blocks:
         lines.append(f"## {title}")
@@ -689,7 +805,7 @@ def sweep_markdown(grid: Dict[str, Any], top_ks: List[int], generated_at: str, m
         lines.append("| min_score | " + " | ".join(f"{metric}@{k}" for k in top_ks) + " |")
         lines.append("|" + "---|" * (len(top_ks) + 1))
         for row in grid["rows"]:
-            label = "off" if row["min_score"] <= NO_THRESHOLD else f"{row['min_score']:.2f}"
+            label = _row_label(row)
             cells = " | ".join(f"{row[f'{metric}@{k}']:.3f}" for k in top_ks)
             lines.append(f"| {label} | {cells} |")
         lines.append("")
@@ -732,6 +848,21 @@ def main() -> int:
                         help="RRF weight of the BM25 branch, sent to /search (tuning)")
     parser.add_argument("--sparse-min-relative", type=float, default=None,
                         help="drop BM25 hits below this fraction of the best BM25 score")
+    parser.add_argument("--rerank", choices=("on", "off", "default"), default="default",
+                        help="cross-encoder reranking: `on` asks for it, `off` forces it off "
+                             "for every request, `default` sends no field and uses RERANK_ENABLED")
+    parser.add_argument("--rerank-top-n", type=int, default=None,
+                        help=f"candidates the cross-encoder scores per request (1..{MAX_RERANK_TOP_N})")
+    parser.add_argument("--rerank-query", choices=("retrieval", "question"), default=None,
+                        help="which text the cross-encoder scores the passages against: "
+                             "`retrieval` (the text retrieval was asked with, what the gateway "
+                             "sends today) or `question` (the user's message, so a long rewrite "
+                             "is judged against the question it was built from). Omitted = no "
+                             "field is sent, so the service default applies. Gateway mode only: "
+                             "in search mode the retrieval query is the question, so the pair "
+                             "query is the same text")
+    parser.add_argument("--sweep-rerank-top-n", default=DEFAULT_SWEEP_RERANK_TOP_N,
+                        help="rerank pools to run as extra retrieval passes with --sweep --rerank on")
     parser.add_argument("--model", default=None, help="model id for gateway mode")
     parser.add_argument("--top-k", type=int, default=None,
                         help=f"candidates per question (default {DEFAULT_TOP_K} for search, "
@@ -766,6 +897,26 @@ def main() -> int:
     if args.sweep_md and not args.sweep:
         parser.error("--sweep-md requires --sweep")
 
+    # `default` sends no rerank field at all, so a baseline run stays byte-identical
+    # to a build without reranking. `off` is an explicit answer: the harness can
+    # compare on/off against one deployed configuration.
+    rerank = None if args.rerank == "default" else args.rerank == "on"
+    pools: List[Optional[int]] = [args.rerank_top_n]
+    if args.sweep:
+        pools = _parse_ks(args.sweep_rerank_top_n)
+    for pool in pools:
+        if pool is not None and not 1 <= pool <= MAX_RERANK_TOP_N:
+            parser.error(f"rerank_top_n must be in 1..{MAX_RERANK_TOP_N}, got {pool}")
+    if args.rerank_top_n is not None and rerank is False:
+        parser.error("--rerank-top-n with --rerank off asks the model to score nothing")
+    if len(pools) > 1 and rerank is not True:
+        parser.error("--sweep-rerank-top-n runs one retrieval pass per pool, so it needs --rerank on")
+    if args.rerank_query is not None and rerank is False:
+        parser.error("--rerank-query with --rerank off asks the model to score nothing")
+    if args.rerank_query is not None and not gateway_mode:
+        parser.error("--rerank-query is a gateway knob: in search mode the retrieval query is "
+                     "the question, so the pair query is the same text and the field changes nothing")
+
     corpus_dir = Path(args.corpus) if args.corpus else None
     questions = load_questions(Path(args.questions), gateway=gateway_mode,
                                corpus_available=corpus_dir is not None)
@@ -791,17 +942,28 @@ def main() -> int:
     base_url = args.gateway_url if gateway_mode else args.api_url
     session = Session(base_url, args.timeout)
     gateway_defaults: Dict[str, Any] = {}
+    results: List[Dict[str, Any]] = []
     try:
         if gateway_mode:
             model = _resolve_model(session, args.api_key, args.model)
             gateway_defaults = read_gateway_defaults(session, args.api_key)
-            results = evaluate_gateway(session, args.api_key, model, questions, top_k,
-                                       corpus_texts(corpus_dir) if corpus_dir else None)
-        else:
-            results = evaluate_search(
-                session, questions, top_k, args.retrieval_mode,
-                args.sparse_weight, args.sparse_min_relative,
-            )
+        for pool in pools:
+            # One retrieval pass per rerank pool. `rerank_top_n` is the size of the
+            # candidate set the cross-encoder sees, so `30` and `50` are two passes
+            # over the same questions, not one pass with two thresholds.
+            if gateway_mode:
+                batch = evaluate_gateway(session, args.api_key, model, questions, top_k,
+                                         corpus_texts(corpus_dir) if corpus_dir else None,
+                                         rerank, pool, args.rerank_query)
+            else:
+                batch = evaluate_search(session, questions, top_k, args.retrieval_mode,
+                                        args.sparse_weight, args.sparse_min_relative,
+                                        rerank, pool)
+            for result in batch:
+                # The pool this pass asked the model to score, so the sweep grid can
+                # tell the passes apart. `None` = reranking was not asked for.
+                result["rerank_top_n"] = pool
+            results.extend(batch)
     except HttpError as exc:
         print(f"HTTP {exc.status} from {base_url}: {exc.body}")
         return 1
@@ -814,13 +976,24 @@ def main() -> int:
     finally:
         session.close()
 
-    summary = summarise(results, args.recall_k, top_k)
-    print_report(summary, results, args.recall_k, args.show_failures)
+    # The headline numbers describe the first pass; the sweep rows carry every pass.
+    headline = [result for result in results if result["rerank_top_n"] == pools[0]]
+    summary = summarise(headline, args.recall_k, top_k)
+    print_report(summary, headline, args.recall_k, args.show_failures)
+    if rerank is False:
+        print("rerank: forced off for every request")
+    elif rerank is True:
+        print(f"rerank: on (pool {pools[0]}), reranked {summary['rerank_rate']:.2f} of questions")
+    else:
+        print(f"rerank: service default, reranked {summary['rerank_rate']:.2f} of questions")
     if gateway_mode and gateway_defaults.get("query_rewrite"):
         print(f"gateway rewrite: {gateway_defaults['query_rewrite']} "
               f"(history={gateway_defaults.get('rewrite_history', '?')})")
+    if gateway_mode and args.rerank_query is not None:
+        print(f"rerank pair query: {args.rerank_query}")
 
-    grid = sweep(results, _parse_ks(args.sweep_top_k), _parse_scores(args.sweep_min_score)) if args.sweep else None
+    grid = sweep(results, _parse_ks(args.sweep_top_k), _parse_scores(args.sweep_min_score),
+                pools) if args.sweep else None
     if grid is not None:
         print_sweep(grid, grid["top_ks"])
 
@@ -838,6 +1011,13 @@ def main() -> int:
             "dataset": str(Path(args.questions)),
             "mode": args.mode,
             "base_url": base_url,
+            # what the retrieval passes asked for, so a rerank-*.json file is
+            # comparable against eval/baseline.json line by line
+            "rerank": args.rerank,
+            "rerank_top_n": pools[0],
+            "rerank_pools": pools,
+            "rerank_query": args.rerank_query,
+            "retrieval_mode": args.retrieval_mode,
             **summary,
             "results": serialisable,
         }

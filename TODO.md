@@ -4,6 +4,39 @@ Actionable plan for the RAG stack. Items are ordered by expected value, not by i
 
 **Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done
 
+## Time budgets — hard rule (2026-11-18, recorded by the owner)
+
+**A full test suite takes about 1 minute.** `python -m unittest discover -s tests -p "test_*.py"` runs 260 tests
+in 26 seconds. **If a test run takes longer than a minute, it is not working correctly** — it is waiting,
+retrying, loading models, or hanging; diagnose that instead of letting it run.
+
+**Never launch a command without an explicit time limit.** Hours have been lost to commands with no timeout.
+Every measured budget below must be signed off against the measured value; if a step exceeds its budget, stop
+and diagnose, do not extend the budget.
+
+| Step | Measured | Expect |
+|---|---|---|
+| Test suite (260 tests) | 26 s | ≤ 1 min |
+| 60-question retrieval sweep, dense, no rerank | ~10 s | ≤ 1 min |
+| 60-question sweep, Qwen3 rerank, 2 pools | ~5 min | ≤ 10 min |
+| 14-question gateway multiturn, 2 pools | ~2.5 min | ≤ 5 min |
+| Docker image rebuild (`docker compose build api`) | ~1 min when cached; ~10 min cold (installs `default-jdk` for `rank-bm25`) | ≤ 15 min |
+| Container start + model load (`bge-small` + `Qwen3-0.6B`) | ~90 s | ≤ 4 min |
+| Health check after recreate | 10 s, then every 10 s, **bounded to ~2 min** | ≤ 4 min |
+| Latency probe, small volume (6 docs × 4 sections, 8 search requests, 2 connections, 30 s ingest window) | minutes | ≤ 5 min for fused + reranked together |
+| User-visible gateway latency, live LLM, 6 requests | generation-bound | ≤ 5 min |
+
+**Measure on a small volume that emulates the situation being fixed, not on the full
+corpus.** The situation P2.4 fixes is search staying responsive while the indexer is
+busy, so the probe needs an ingest window and a handful of concurrent search requests —
+not a large corpus. Reading a multiplier from 8 requests is enough; the full corpus is
+for quality grids, not for latency. Never let a probe run for hours: if it exceeds its
+budget, stop and diagnose.
+
+Health-check loops must use a condition that can actually match (`ready True` and the prompt text are
+separated by the model name, so `-match 'ready True Given'` never matches and the loop sleeps 20 minutes).
+Check health with `eval_retrieval.Session`, not `Invoke-WebRequest` (fails against `localhost` on this machine).
+
 ## Product direction — Local Knowledge Engine
 
 **Target definition:** a local-first, model-agnostic knowledge and context service that indexes documents
@@ -167,22 +200,67 @@ model, chunking, or query-prompt change; the numbers are not transferable.
 **Why:** a cross-encoder reordering the top candidates usually gives the largest precision gain, especially for paraphrased or long queries.
 
 **Scope:**
-- [ ] Retrieve 30–50 candidates and rerank them, pass 5–8 to the LLM. The candidate
+- [x] Retrieve 30–50 candidates and rerank them, pass 5–8 to the LLM. The candidate
   list is the **fused hybrid list** (`POST /search` requests `2 × top_k` candidates,
   capped at 100), not dense-only: after P2.1 the items that push relevant chunks out
-  of the top 10 come from the BM25 branch.
-- [ ] Evaluate `Qwen3-Reranker-0.6B` and `BAAI/bge-reranker-v2-m3` (or `jina-reranker-v2-base-multilingual`).
-- [ ] Decide placement: inside `api` (same GPU, simplest) or a separate `reranker` service (isolated VRAM/latency).
-- [ ] Add a `/rerank` contract or a `rerank=true` flag on `/search`; keep the gateway backwards compatible.
-- [ ] Add a fallback: if the reranker fails, return dense results unchanged.
-- [ ] Report latency impact (p50/p95) and VRAM usage.
+  of the top 10 come from the BM25 branch. Measured: pool 30 is enough — pool 50 gives
+  the same grids at higher latency on both models.
+- [x] Evaluate `Qwen3-Reranker-0.6B` and `BAAI/bge-reranker-v2-m3`. **`bge` does not
+  meet the criterion** (follow-up MRR@10 `0.511` against the committed `0.770`);
+  `Qwen3-Reranker-0.6B` is the better model on both sets.
+- [x] Decide placement: inside `api` (same GPU, simplest) — one serialized GPU queue,
+  no extra service, no extra network hop.
+- [x] Add a `rerank=true` flag on `/search`; the gateway passes it through as a
+  tri-state (`X-RAG-RERANK: on|off`, absent sends no field) and the pool key travels
+  only with `rerank: true`. `rerank_score` is a new optional field; `score` keeps its
+  measured P0 meaning, so `min_score` is unaffected.
+- [x] Choose the pair text the model scores: `api` accepts `rerank_query` (capped
+  4000 chars), the gateway sends `X-RAG-RERANK-QUERY: retrieval|question`, `retrieval`
+  sends no field, and the pair travels only with `rerank: true`. Measured: the knob
+  works on the case it was built for and loses on the set, so the default is
+  `retrieval` (see Notes).
+- [x] Add a fallback: if the reranker fails, return the fused order unchanged
+  (missing model, load failure, `RERANK_TIMEOUT`, score-count mismatch — never an error).
+- [x] Report latency impact (p50/p95) and VRAM usage.
 
 **Acceptance criteria:**
-- `recall@10` does not regress; `MRR@10` / precision at the injected `k` improves on the evaluation set.
-- Search still works with the reranker disabled and when it is down.
-- VRAM fits alongside the embedding model on 8 GB.
+- [x] `recall@10` does not regress; `MRR@10` / precision at the injected `k` improves on
+  the evaluation set. Measured on the live stack: single-turn `recall@10 0.867 → 0.917`,
+  `MRR@10 0.486 → 0.649`, `nDCG@10 0.642 → 0.804`; follow-ups `MRR@10 0.4529 → 0.7028`,
+  `nDCG@10 0.7103 → 0.8747`, `recall@5 0.778` (fused `0.778`, `bge` `0.667`).
+  `recall@10` on follow-ups is `0.889` against the dense-only committed `1.000` —
+  that is the P2.1 fusion cost, not the reranker's, and it is the same at `rerank=off`
+  on the same gateway request.
+- [x] Search still works with the reranker disabled and when it is down (tested at the
+  gateway: `off` sends an explicit `rerank: false`, no header sends no field, and
+  `rerank=true` with no model loaded is answered as a fused result, never an error).
+- [x] VRAM fits alongside the embedding model on 8 GB (`RTX 4060 Laptop 8188 MiB`:
+  `7671 MiB` used / `286 MiB` free with `Qwen3-Embedding-0.6B` + `Qwen3-Reranker-0.6B`
+  resident; `RERANK_ENABLED=false` frees the reranker's pages).
 
-**Notes:** reranking 50 candidates with a 0.6B cross-encoder costs more than embedding one query; measure before enabling by default. Consider running the reranker on CPU if VRAM is tight. RRF is rank-based, so an intruder from the BM25 branch sits at a fixed high rank (16th with `top_k=8`), not just below the cut — a cross-encoder that re-scores content, not position, is what removes it. The measured case is `mt-003` in **P2.1**: dense rank 9, hybrid rank 13.
+**Notes:** reranking 50 candidates with a 0.6B cross-encoder costs more than embedding
+one query; measured p50 `1.49s` on `Qwen3-Reranker-0.6B` against `0.59s` on
+`bge-reranker-v2-m3` and `0.087s` fused. Consider running the reranker on CPU if VRAM is
+tight. RRF is rank-based, so an intruder from the BM25 branch sits at a fixed high rank
+(16th with `top_k=8`), not just below the cut — a cross-encoder that re-scores content,
+not position, is what removes it. The measured case is `mt-003` in **P2.1**: dense rank
+9, hybrid rank 13. **The reranker does not fix `mt-003` on its own, and the query
+prompt does not either** (`Qwen3` with `RERANK_QUERY_INSTRUCT=qwen3` leaves it outside
+the top ten, and the instruction makes the single-turn grid worse: `recall@10 0.900` vs
+`0.917`, `MRR@10 0.621` vs `0.649`). The reranker raises follow-up MRR by moving real
+answers up; the intruder has to be removed by the fusion of P2.1, so the default is
+`Qwen/Qwen3-Reranker-0.6B` with **plain pairs** (`RERANK_QUERY_INSTRUCT` empty), pool 30,
+opt-in, and P1.1 does not claim the `mt-003` criterion.
+
+Which text the model judges is the third knob, and it was measured: `X-RAG-RERANK-QUERY:
+question` scores the passages against the user's message instead of the long `concat`
+rewrite, which puts `mt-003`'s expected chunk at **rank 1** (it was rank 20 with the
+rewrite as the pair, and outside the top ten in every plain and instructed pass). It is
+a net loss on the set: `mt-001` rank `1 → 12`, `mt-006` rank `1 → 16`, follow-up
+`recall@10 0.889 → 0.778`, `MRR@10 0.703 → 0.509`, `nDCG@10 0.875 → 0.513`. A short
+question drops the topical anchor an elliptical follow-up needs, so the same history
+terms that push `mt-003` down carry `mt-001` and `mt-006` up. `RAG_RERANK_QUERY`
+stays `retrieval`; `question` is a per-request knob for the long-rewrite case.
 
 ### [~] P1.2 Structure-aware chunking + citation metadata
 
@@ -338,19 +416,31 @@ therefore a named volume, and `./qdrant_snapshots` is bind-mounted so node snaps
 - A snapshot can be restored into a fresh Qdrant instance. *(met: restore into a volume-free instance, checked with `status`, scroll and search)*
 - The README documents the exact commands and caveats.
 
-### [~] P2.4 Indexing vs query contention
+### [x] P2.4 Indexing vs query contention
 
 **Why:** bulk indexing and user queries share one GPU and one model; a large ingest delays search.
 
 **Scope:**
 - [x] Measure search latency during a bulk ingest.
-- [ ] Options: lower indexer batch size, sleep between batches, a priority queue in `api`, a separate embedding instance for indexing, or CPU embedding for the indexer.
+- [x] Options: lower indexer batch size, sleep between batches, a priority queue in `api`, a separate embedding instance for indexing, or CPU embedding for the indexer. **Measured as unnecessary**: search did not degrade during bulk indexing, so none of these is shipped and the serialized queue stays at 1.
 - [x] Add a concurrency limit around `model.encode` so concurrent requests do not pile up.
 - [x] Expose queue/latency metrics (at least in logs).
 
 **Acceptance criteria:**
 - Search p95 latency stays within an agreed budget during indexing.
 - Indexing still completes in a reasonable time.
+
+**Budget, signed off against the measurement (2026-11-18):** rerank-on search
+`p95 <= 1.5s` while the indexer is busy (measured `p95 1.05s` inside a 20s window with
+60 chunks added), fused search `p95 <= 0.10s` (measured `0.094s` idle, `0.052s`
+settled). Indexing throughput `~1.5 files/s` at `EMBED_BATCH_SIZE=32` (chunks upserted
+every ~0.5s per file). Measured on one warmed connection, pool 30,
+`Qwen/Qwen3-Reranker-0.6B`: **search did not degrade during bulk indexing** —
+`p50 x0.97 / p95 x1.06` against its own idle latency — so no queue priority, smaller
+batch, sleep between batches, second embedding instance, or CPU embedding for the
+indexer is needed. The serialized queue (`EMBEDDING_MAX_CONCURRENCY=1`) is what
+keeps it that way, and the price of keeping rerank on the request path is
+`p50 x11 / p95 x10` against fused in the same run.
 
 **Notes:** `EMBEDDING_MAX_CONCURRENCY` (default `1`) wraps `model.encode` in an
 `asyncio.Semaphore` in `api/embedder.py`, so encode calls queue one at a time
@@ -363,6 +453,33 @@ baseline and gateway eval runs were also loading the API, so its absolute
 latencies are inflated; the idle-vs-ingest comparison on a quiet stack and the
 budget decision are still to be done, and the `api` container has to be rebuilt
 for the queue to take effect.
+
+Measured 2026-11-18: that sample reads `idle p50 21.24s` / `ingest p50 21.27s` /
+`settled p50 21.28s`, so the ingest multiplier is `x1.00` in absolute terms and the
+number is connection setup, not the GPU queue — `measure_search` now reuses one
+keep-alive connection per worker through `eval_retrieval.Session`, which is what
+makes idle-vs-ingest a measurement of contention. Re-measuring on a quiet stack with
+`--rerank-compare` (the reranker's cost and the ingest multiplier in one run), and the
+budget is recorded as `p95 <= <value>` with the ingest throughput that paid for it.
+
+Measured 2026-11-18 on a quiet stack, one connection, warmed, `--rerank-compare`,
+pool 30, `Qwen/Qwen3-Reranker-0.6B`: fused `p50 0.047s / p95 0.059s`, rerank
+`p50 0.855s / p95 0.930s` — **the price of scoring the pool is p50 ×18.3, p95 ×15.7**.
+The probe is bounded by `--budget` (60s default): every loop, including the indexer
+wait, stops at the deadline, and every phase prints its numbers and the time left, so
+an over-budget run is diagnosed at the phase, not watched. Two mechanics that the
+first bounded runs showed:
+
+- **a connection that has not been used costs ~20s on the first request**, the same
+  request on a warmed connection ~1s (measured: 22.15s, 22.17s, then 0.89s on the
+  second request of the same connection). The probe warms every connection before
+  anything is timed, so a phase reads the GPU queue and not connection setup.
+- **the probe deletes its files at the end, which kills the overlap**: the indexer
+  works through files at ~1.5 files/s (`Upserted 4 chunks` every ~0.5s), so files
+  deleted by the probe before the indexer reaches them leave the ingest window with
+  nothing to index, and `chunks_added=0` reads as idle. `--keep` holds the files, so
+  the window overlaps real indexing; the points delta is sampled at the window
+  boundary, not waited for.
 
 ---
 
@@ -383,21 +500,67 @@ for the queue to take effect.
 - Latency and quality do not regress for single requests.
 - Rollback to the in-process model is documented.
 
-### [ ] P3.2 Query embedding cache
+### [x] P3.2 Query embedding cache
 
 **Why:** repeated questions still run a full forward pass.
 
 **Scope:**
-- [ ] Add an LRU cache keyed by `(model, prompt_name, normalized_text)`.
-- [ ] Bound memory (vectors are ~4 KB each at 1024 dims).
-- [ ] Add hit/miss counters to `/health` or logs.
-- [ ] Consider caching at the gateway for full user messages.
+- [x] Add an LRU cache keyed by `(model, prompt_name, normalized_text)`. **`normalized_text` is the query with surrounding whitespace stripped, not a case-folded string**: lowercasing changes the embedding, so a cached answer would be a vector for a different text.
+- [x] Bound memory (vectors are ~4 KB each at 1024 dims).
+- [x] Add hit/miss counters to `/health` or logs.
+- [x] Consider caching at the gateway for full user messages. **Measured as not needed in P3.2**: `/search` has exactly one query text, so a gateway cache would be a second copy of the same lookup, and a gateway key must also carry conversation history. Deferred with P9.2 (result caching), whose key needs retrieval configuration, workspace/collection filters, embedding profile, and index version/state.
 - [ ] For result caching (P9.2), keys must include retrieval configuration, workspace/collection filters, embedding profile, and index version/state.
 
 **Acceptance criteria:**
 - Repeated identical queries hit the cache and skip `model.encode`.
 - Memory stays bounded under a long-running workload.
 - Cached results are never returned for a different workspace/collection scope.
+
+**Measured against the running stack (2026-11-18, `api` rebuilt, collection of 202
+points, `Qwen3-Embedding-0.6B`, dim 1024, `EMBEDDING_CACHE_SIZE=256`):**
+- Two identical `POST /search`: `hits +1, misses +0` — the second query cost no
+  forward pass. Padded with spaces, the same question is one entry (`strip` is part
+  of the key): `hits +2, misses +0`.
+- 300 distinct queries with `rerank: false` in **29.3 s**: `entries` reached `256` and
+  stayed there, `approx_bytes` `1,077,248` = exactly the bound
+  `256 x (1024x4 + 112)`. The oldest entry (`probe query 000`) encoded again on a
+  re-query (`misses +1`) and the newest was answered from the cache (`hits +1`), so
+  LRU eviction is in effect, not just a counter.
+- `4001`-char `query` is rejected with `422` before encoding, `4000` is accepted: the
+  memory bound includes the key text.
+- An all-whitespace query returns hits and is counted as one miss: the model receives
+  a single space, not an empty string (the guard `/embed` and `/v1/embeddings` use).
+
+**Budget, measured against the run (2026-11-18):** the whole suite is `298` tests in
+`30.5s` (`<= 60s`); the cache file is `16` tests in `0.14s` (`2.6s` wall, the
+`torch` import is the cost); `api` rebuild `~1min` cached; the live pair check `2.4s`;
+the 300-query bound loop `29.3s` with `rerank: false` (`~0.94s` per request with
+rerank on does not fit a 3-minute budget, so the loop measures the cache leg).
+Health checks use `eval_retrieval.Session` (one warmed connection), not
+`Invoke-WebRequest`.
+
+**Notes:** the cache is in `Embedder.embed_query` in `api/embedder.py`, not in
+`api/main.py`: the model path and the resolved prompt are known there and every query
+call passes through one method. A hit is answered **before** the `EMBEDDING_MAX_CONCURRENCY`
+semaphore, so a repeated question does not wait behind a bulk ingest — this is the
+P2.4-relevant win. `embed_query` takes one string and returns shape `(1, dim)`
+(`/search` indexes `vectors[0]`); the batch-miss logic is removed, because `/search`
+has exactly one query text and nothing else calls this method. The cached value is a
+copy (`np.array(..., float32)`), so the caller cannot mutate the cache and no batch
+array stays alive behind an entry. `cache_size=0` disables it. Counters count
+**positions**, not distinct texts, and `/health` reports `embedder_cache`
+(`enabled`/`entries`/`max`/`hits`/`misses`/`vector_dim`/`approx_bytes`). Not cached:
+documents (`POST /embed`), `POST /v1/embeddings`, and BM25 (`SparseEmbedder`). The
+cache is one `api` process, cleared on restart; there is no shared cache and no TTL.
+`SearchRequest.query` is capped at `max_length=4000` (the repo's own cap:
+`rerank_query`, `RERANK_QUERY_MAX_CHARS`; the gateway `concat` rewrite is capped at
+2000), which is what makes the memory bound real. `sentence_transformers` is imported
+inside `Embedder.__init__` (the convention `SparseEmbedder` uses), so the cache rules
+are tested against a fake model that counts forward passes, with no GPU, Docker, or
+model download. `tests/test_embedding_cache.py` covers repeat, shape, whitespace keys,
+case, the empty-string guard, copy-on-store, LRU bound and eviction order, `cache_size=0`,
+model change, prompt change, a hit answering while the encode queue is held, documents
+bypassing the cache, and the `/health` counters.
 
 ### [ ] P3.3 Qdrant quantization and payload indexes
 

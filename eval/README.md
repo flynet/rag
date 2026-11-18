@@ -137,6 +137,9 @@ Useful options:
 | `--retrieval-mode` | — (`api` default) | `hybrid` or `dense`, sent as `mode` to `/search` (search mode only) |
 | `--sparse-weight` | — (`SPARSE_WEIGHT`) | RRF weight of the BM25 branch, sent to `/search` (search mode only) |
 | `--sparse-min-relative` | — (`SPARSE_MIN_RELATIVE`) | drop BM25 hits below this fraction of the best BM25 score (search mode only) |
+| `--rerank` | `default` | `on` asks for cross-encoder reranking, `off` forces it off, `default` sends no field at all (`RERANK_ENABLED` / `RAG_RERANK` decides) |
+| `--rerank-top-n` | — (`RERANK_TOP_N`, 30) | candidates the cross-encoder scores per request, `1..100` |
+| `--sweep-rerank-top-n` | `30` | pools to run as extra retrieval passes with `--sweep --rerank on` |
 | `--min-recall` | — | exit 1 if `recall@max(recall-k)` is below the value |
 | `--min-mrr` | — | exit 1 if `MRR@10` is below the value |
 
@@ -177,7 +180,142 @@ The gateway has no way to pass them, so a gateway run uses the service defaults 
 
 The grid is in [`p21-sweep.md`](p21-sweep.md) with the file each number came from. Reading it: the floor matters more than the weight (`0.7` is the best recall@10), and `weight=1.5` buys MRR/nDCG at the cost of recall, so `1.0` stays the default. The follow-up set is the binding one: BM25 gains on long rewritten questions with many common terms (`mt-003`: rank 9 → 13), which is what the reranker (P1.1) is for.
 
-### The tuning record
+### Sweep for the reranker (P1.1)
+
+The reranker changes the order, so the harness has to score the order the reranker
+produced. `rank_hits` ranks the injected chunks by `rerank_score` when the response
+carries it, and by `score` (the fused order) when it does not, so a reranked pass is
+measured on the order the gateway injects, not on the RRF position the candidate came
+in at. `rerank_top_n` is the pool the model sees, so pool size is a **retrieval pass**
+axis, not a grid row: `--sweep-rerank-top-n 30,50` calls the API once per pool, and the
+grid rows are labelled `0.30 rerank=30`, `0.30 rerank=50`, and unlabelled rows for the
+pass that never asked for reranking.
+
+```powershell
+Copy-Item eval/corpus/* data/documents/
+docker compose up -d --force-recreate api        # RERANK_ENABLED=true, RERANK_MODEL set
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --limit 1   # warm the connection
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank on --rerank-top-n 30 --json-out eval/rerank-on-30.json
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank on --sweep-rerank-top-n 30,50 --sweep --sweep-md eval/sweep-rerank.md \
+    --json-out eval/rerank-sweep.json
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank off --json-out eval/rerank-off.json          # same service, rerank forced off
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --rerank on --sweep-rerank-top-n 30,50 --sweep \
+    --json-out eval/rerank-multiturn.json
+```
+
+For a model trained on an instructed pair, measure it both ways, because the prompt is
+a quality change with a latency cost of its own:
+
+```powershell
+$env:RERANK_QUERY_INSTRUCT = "qwen3"
+docker compose build api                          # the new code, not the image built earlier
+docker compose up -d --force-recreate api         # /health reports rerank_query_instruct
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank on --top-k 50 --sweep-rerank-top-n 30,50 --sweep \
+    --sweep-md eval/sweep-qwen3-instruct.md --json-out eval/rerank-qwen3-instruct-sweep.json
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --rerank on --top-k 20 --sweep-rerank-top-n 30,50 --sweep \
+    --json-out eval/rerank-qwen3-instruct-multiturn.json
+```
+
+Measure which text the model judges, because a long rewrite is a pair of two texts and
+the history in it is term noise:
+
+```powershell
+# quality passes use the stub upstream: the gateway fills X-RAG-Sources before
+# generation and the rewrite is concat, so a real LLM adds generation time only
+# (a 4B model with ~5000 tokens of injected context) and no extra information.
+python scripts/upstream_stub.py --port 5011              # answers instantly
+$env:UPSTREAM_BASE_URL = "http://host.docker.internal:5011/v1"   # compose reads shell env first
+docker compose up -d --force-recreate gateway            # .env keeps the live LLM URL
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --rerank on --top-k 20 --rerank-query question \
+    --sweep-rerank-top-n 30,50 --sweep --sweep-md eval/sweep-qwen3-question-multiturn.md \
+    --json-out eval/rerank-qwen3-question-multiturn.json
+# the single case it fixes, read from the diagnosis tool (no gateway, no upstream):
+python scripts/diagnose_rerank.py --question-id mt-003 --mode search \
+    --retrieval-query concat --rerank on --rerank-top-n 30 --top-k 20 \
+    --rerank-query question --show-text 0        # first_rank 1, was 20 with the rewrite as the pair
+```
+
+Three numbers say whether the reranker is worth the latency:
+
+- `rerank_rate` — the share of questions that were actually reranked. `0` on a `rerank=N`
+  row means the model was asked for and did not run (load failure, timeout over
+  `RERANK_TIMEOUT`, a score count that did not match the candidates), so that row is the
+  fused baseline, not a reranked result.
+- `MRR@10` with `--rerank on` against `--rerank off` on the same deployment — the P1.1
+  acceptance criterion is that ranking improves, and the single-turn set has to show no
+  recall regression.
+- `mt-003` — the BM25 term-noise follow-up that went from rank 9 to 13 when the hybrid branch arrived. It is
+  the question the reranker exists for, so `--show-failures` output has to show it back inside the top ten.
+  Measured 2026-11-18 with `BAAI/bge-reranker-v2-m3`: it is **not** in the top ten, at pool 30 or pool 50, so the
+  criterion is not met by that model on this corpus. `scripts/diagnose_rerank.py` prints what beat it:
+
+```powershell
+python scripts/diagnose_rerank.py --question-id mt-003 --rerank on --rerank-top-n 30 --top-k 20
+python scripts/diagnose_rerank.py --question-id mt-003 --rerank off --top-k 20
+python scripts/diagnose_rerank.py --question-id mt-003 --mode search --retrieval-mode dense \
+    --retrieval-query concat --rerank off --top-k 20
+```
+
+The first run prints the order the gateway injected with `score` and `rerank_score` side by side, and `*` marks
+the chunk the question expects; the second prints the fused order for the same request. The rank change is read
+as a cause: which chunk came first, and which number put it there. The third prints the **dense-only** order for
+the *same request string*: `--retrieval-query concat` sends the gateway's `concat` rewrite in search mode, so the
+comparison is about fusion, not about a shorter query. `--retrieval-mode` is a `/search` knob, so it is refused
+in gateway mode.
+
+`min_score` keeps filtering `score`, never `rerank_score`, so a reranker preference cannot
+resurrect a hit the threshold removes; the sweep grid stays comparable with the committed
+single-turn and multiturn tables. Gateway mode sends `X-RAG-RERANK: on|off` and
+`X-RAG-RERANK-TOP-N`, and reads `rerank_score` back from `X-RAG-Sources`, so
+`rerank_rate` is recorded in gateway runs too. Every `--json-out` file stores
+`rerank`, `rerank_pools`, and per-question `rerank_scores`.
+
+The latency side of the same decision is measured by `scripts/latency_probe.py`, on
+one deployment, on the GPU queue the reranker shares with the embedding model. It
+runs **small, on the situation being fixed** — search staying responsive while the
+indexer is busy — and the whole run is capped by `--budget` (default 60s): every loop,
+including the wait for the indexer, stops when the budget is used up, and every phase
+prints the time it has left. The defaults are that size, so the command is short —
+`--rerank-compare` measures fused and reranked on one card in one run:
+
+```powershell
+python scripts/latency_probe.py --rerank on --rerank-top-n 30 --rerank-compare --json-out eval/perf-rerank.json
+```
+
+The printed `rerank cost vs fused` multiplier is the price of scoring the pool, and
+`ingest` / `settled` show what the price is while the indexer is busy. `chunks_added`
+in the `ingest` phase is the overlap check: it counts the chunks the indexer inserted
+**during** the search window, so `chunks_added=0` means the window ended before the
+indexer started and the numbers say nothing about contention. Measured on the live
+stack: rerank on pool 30 costs **p50 x15.4 / p95 x13.3** against fused search
+(0.829s against 0.054s), and search under the ingest window stayed at **p50 x1.05 /
+p95 x1.15** of its own idle latency. Two measured
+facts about the queue, both built into the probe: a rerank request costs ~1s on a
+connection that has been warmed and ~20s on one that has not, so **every connection
+is warmed before anything is timed**; and the queue is serialized
+(`max_concurrency=1`), so `--concurrency 1` reads the queue and more connections add
+queue waiting. `/health` on `api` reports `rerank_enabled`, `rerank_model`,
+`rerank_top_n`, `rerank_transform`; record those with the numbers, because a rerank
+measurement is a property of the model and the dtype, not of the code. VRAM headroom
+is read from `nvidia-smi` with both models resident — the reranker is a second model
+on the same card as the embedding model, and that is what bounds `RERANK_TOP_N`.
+
+The user-visible number is measured against the **live LLM**, on a small sample, after
+the GPU probes finish (embedding and reranker are one serialized queue, so two runs at
+once inflate both):
+
+```powershell
+python scripts/eval_retrieval.py --questions eval/questions.multiturn.jsonl --mode gateway \
+    --corpus eval/corpus --rerank on --top-k 20 --limit 6 --json-out eval/live-latency.json
+```
+
 
 The sweeps that produced the committed values are kept in the repository:
 
@@ -190,6 +328,14 @@ The sweeps that produced the committed values are kept in the repository:
 | `eval/multiturn-gateway.json` + `eval/sweep-multiturn.md` | the same 9 conversations, rewrite `concat` (the shipped default) | recall@5 `0.778`, recall@10 `1.000`, MRR@10 `0.420`, nDCG@10 `0.770`; `min_score=0.3`: recall@8 `0.889`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `11%`; `0.6`: `67%` |
 | `eval/multiturn-llm.json` + `eval/sweep-multiturn-llm.md` | the same 9 conversations, rewrite `llm` | recall@5 `0.889`, recall@10 `1.000`, MRR@10 `0.514`, nDCG@10 `0.781`; `min_score=0.3`: recall@8 `1.000`, zero-context `0%`; `0.5`: recall@8 `0.667`, zero-context `22%` — the best ranking, at one extra upstream call per follow-up |
 | `eval/p21-sweep.md` + the `eval/p21-*.json` files | dense-only vs dense + BM25 (RRF), `SPARSE_WEIGHT` × `SPARSE_MIN_RELATIVE`, 60 single-turn (`/search`, top_k=10) and 9 follow-up (gateway, top_k=20) questions | selected `SPARSE_WEIGHT=1.0` / `SPARSE_MIN_RELATIVE=0.7`: single-turn recall@10 `0.883` (dense-only `0.800`), recall@5 `0.750`; gateway single-turn recall@10 `0.883`, MRR@10 `0.490`; follow-ups recall@10 `0.889` / MRR@10 `0.453` against dense-only `1.000` / `0.420` |
+| `eval/sweep-rerank.md` + `eval/rerank-sweep.json` + `eval/rerank-off.json` | cross-encoder `BAAI/bge-reranker-v2-m3` (cuda, fp16, `RERANK_TRANSFORM=raw`), fused pool 30 vs 50, and the same service with rerank forced off, 60 single-turn questions through `/search` (top_k 50 candidates) | **rerank on, pool 30**: recall@5 `0.733`, recall@10 `0.883`, MRR@10 `0.620`, nDCG@10 `0.765`, `rerank_rate 1.0`, p50 `0.590s` / p95 `0.671s`. Baseline `--rerank off`: recall@5 `0.700`, recall@10 `0.867`, MRR@10 `0.486`, nDCG@10 `0.642`, p50 `0.087s` / p95 `0.135s`. Pool 50 scores the same grid (recall@10 `0.883`, MRR@10 `0.620`) at p50 `0.611s` / p95 `0.710s` — scoring 30 is enough, so `RERANK_TOP_N=30`. The reranker costs `+0.50s` p50 (x6.8) and buys `+0.134` MRR@10 and `+0.016` recall@10; gates `--min-recall 0.70 --min-mrr 0.35` pass on every pass. |
+| `eval/rerank-multiturn.json` | 9 follow-up conversations, gateway mode with `scripts/upstream_stub.py` as the upstream, pools 30 vs 50, rewrite `concat`, `BAAI/bge-reranker-v2-m3` | **rerank on, pool 30**: recall@5 `0.667`, recall@10 `0.889`, MRR@10 `0.511`, nDCG@10 `0.754`, `rerank_rate 1.0`, p50 `0.451s` / p95 `0.528s` (stub upstream — retrieval and rewrite only, no answer generation). Pool 50 adds nothing at no-threshold (`MRR@10 0.511`) and `0.582` at `min_score 0.4` vs `0.526` for pool 30. **This file's `rerank off` rows are not a fused baseline**: the gateway sent `rerank: true` only, so `api` applied its `RERANK_ENABLED=true` default and `rerank_rate` was `1.0` on every row — the numbers below are the fused baseline re-measured after the tri-state fix. |
+| `eval/rerank-off-multiturn.json` | the same 9 conversations, gateway mode, `X-RAG-RERANK: off` forced through the fixed gateway, pools labelled 30 | fused baseline: recall@5 `0.778`, recall@10 `0.889`, MRR@10 `0.4529`, nDCG@10 `0.7103`, `rerank_rate 0.0` (the model never ran), avg candidates 20, p50 `0.098s` / p95 `0.131s`. Gates `--min-recall 0.70 --min-mrr 0.35` pass. **`mt-003` fused `first_rank 13`** — already outside the top 10 before reranking, and out of the returned list after it. So on this corpus `BAAI/bge-reranker-v2-m3` buys MRR `0.4529 → 0.511` and nDCG `0.7103 → 0.754`, loses recall@5 `0.778 → 0.667`, and does not meet the P1.1 multiturn criterion. |
+| `eval/rerank-off-multiturn-topk8.json` + `eval/rerank-multiturn-topk8.json` | the same 9 conversations at the shipped `RAG_TOP_K=8`, gateway, fused vs `rerank on` pool 30 | fused: recall@5 `0.778`, recall@10 `0.889`, MRR@10 `0.456`, nDCG@10 `0.655`, `mt-003` absent from the returned 8; rerank on: `0.667`, `0.889`, `0.511`, `0.694`, `mt-003` absent, p50 `0.45s`. **`top_k` is not the cause** — `mt-003` is outside the top ten before reranking at every `top_k`, which is the P2.1 hybrid regression recorded in the row above. The reranker has to pull it back, and `bge-reranker-v2-m3` does not: the expected chunks score below `0.118` and leave the pool |
+| `eval/rerank-qwen3-sweep.json` + `eval/sweep-qwen3.md` + `eval/rerank-qwen3-multiturn.json` | `Qwen/Qwen3-Reranker-0.6B` (cuda, fp16), the same 60 single-turn (`/search`, top_k 50) and 9 multiturn (gateway, top_k 20, stub upstream, rewrite `concat`) questions, pools 30 vs 50, **plain pairs** (`RERANK_QUERY_INSTRUCT` off) | single-turn pool 30: recall@5 `0.850`, recall@10 `0.917`, MRR@10 `0.649`, nDCG@10 `0.804`, `rerank_rate 1.0`, p50 `1.49s` / p95 `1.77s`. Gateway multiturn pool 30: recall@5 `0.778`, recall@10 `0.889`, MRR@10 `0.703`, nDCG@10 `0.875`, p50 `0.94s` / p95 `1.18s`. **Against `bge-reranker-v2-m3` this model is better at every rank on the single-turn set** (recall@10 `0.917` vs `0.883`, MRR@10 `0.649` vs `0.620`) and on the follow-ups (MRR@10 `0.703` vs `0.511`, fused baseline `0.4529`), at 2.5x the latency. **`mt-003` is still outside the top ten**, so the criterion is not met by either model with plain pairs. The pass that decides the default is the one that puts `mt-003` back inside the top ten with no `recall@10` regression, at a latency the ingest probe can pay. Plain pairs scored this model `probe score=-2.0625` on an obvious match, and its top `rerank_score` values on `mt-003`'s pool (`7.9453`, `4.3594`, `3.7812`) are term-noise chunks, so the instruction is expected to move the numbers. **Measured plain pairs, pool 30:** single-turn recall@5 `0.850`, recall@10 `0.917`, MRR@10 `0.649`, nDCG@10 `0.804` (the best grid on the corpus); follow-ups MRR@10 `0.703`, nDCG@10 `0.875` |
+| `eval/rerank-qwen3-instruct-sweep.json` + `eval/sweep-qwen3-instruct.md` + `eval/rerank-qwen3-instruct-multiturn.json` | the same two sets with `RERANK_QUERY_INSTRUCT=qwen3` (`Given a query, retrieve passages that answer the query.`), measured on the rebuilt image | **first pass was invalid**: `docker compose up -d --force-recreate api` runs the image built earlier, so the container had no `RERANK_QUERY_INSTRUCT` code, `/health` reported `rerank_query_instruct` as absent, and the two passes printed the same grid to the digit as the plain-pair pass. Signature of an invalid pass: grid identical to the digit to the pass it is supposed to differ from. Measured on the rebuilt image, single-turn pool 30: recall@5 `0.833`, recall@10 `0.900`, MRR@10 `0.621`, nDCG@10 `0.762`, p50 `1.39s` / p95 `1.60s`; pool 50 identical. **The instruction hurts the single-turn set** (`recall@10 0.900` vs `0.917`, `MRR@10 0.621` vs `0.649`, `nDCG@10 0.762` vs `0.804` for plain pairs). Gateway multiturn pool 30: recall@5 `0.778` (plain `0.733`, `bge` `0.667`, fused baseline `0.778`), recall@10 `0.889`, MRR@10 `0.700` (plain `0.703`), nDCG@10 `0.832` (plain `0.875`), p50 `0.98s`. Pool 50: recall@10 `0.889`, MRR@10 `0.644` — worse than pool 30. **`mt-003` is outside the top ten in both instructed and plain passes**, so the prompt is not the lever that fixes it; the lever is the fusion of P2.1 (see `mt-003` below) |
+| `eval/rerank-qwen3-question-multiturn.json` + `eval/sweep-qwen3-question-multiturn.md` | 9 follow-up conversations, gateway, pools 30 vs 50, **pair query = the user's question** (`X-RAG-RERANK-QUERY: question`), plain pairs, `Qwen/Qwen3-Reranker-0.6B` | pool 30: recall@5 `0.556`, recall@10 `0.778`, MRR@10 `0.509`, nDCG@10 `0.513`, `rerank_rate 1.0`, p50 `1.03s` / p95 `1.11s`; pool 50 `MRR@10 0.507` (no gain). Per-question first rank, `question` vs `retrieval`: **`mt-003` `1` vs `99`** (the lever works on the case it was built for — scoring the injected history ranks its term overlap above the answer), `mt-001` `12` vs `1`, `mt-006` `16` vs `1`, `mt-005` `6` vs `8`. **Net loss**: `recall@10 0.778` vs `0.889`, `MRR@10 0.509` vs `0.703`, `nDCG@10 0.513` vs `0.875`. A short question drops the topical anchor an elliptical follow-up needs, so the same history terms that push `mt-003` down carry `mt-001` and `mt-006` up. **`RAG_RERANK_QUERY=retrieval` stays the default**; `question` is a per-request knob. The P1.1 `mt-003` criterion is met by the mechanism, not by a shippable configuration: no measured pass (bge, Qwen3 plain, Qwen3 instructed, pair=question) leaves `mt-003` inside the top ten **and** the aggregate unregressed |
+| `mt-003` diagnosis: dense vs hybrid on the gateway's query | `scripts/diagnose_rerank.py --question-id mt-003 --mode search --retrieval-mode dense --retrieval-query concat --rerank off --top-k 20` | **the expected chunk is at dense rank 9** on the `concat` request (`Which embedding model does the stack use?\nСколько измерений у её векторов?`), at hybrid rank 13, and outside the reranked top 20. So fusion, not the reranker, is what removed it, and the reranker's scores on this pool (`7.9453`, `4.3594`, `3.7812` on `README.md` chunks 47/48/59) put term noise above it |
 
 `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` is the choice all the tables support, and the
 follow-up sweep (`eval/sweep-multiturn.md`) is the binding one for the threshold:
@@ -356,6 +502,20 @@ added.
   evaluated, only the retrieved sources), so it is slower and needs a working
   `UPSTREAM_BASE_URL`. `RAG_QUERY_REWRITE=llm` adds one more call per follow-up,
   bounded by `RAG_REWRITE_TIMEOUT`.
+- When the LLM server is not reachable, `scripts/upstream_stub.py` answers in place
+  of it (`UPSTREAM_BASE_URL=http://host.docker.internal:5011/v1` from the gateway
+  container). The stub returns instantly, so gateway latency measured against it is
+  the cost of retrieval and rewriting, not of generating an answer — record which
+  upstream produced the numbers, and re-measure against the real server before
+  quoting latency as the user-visible figure.
+
+- A reranked gateway run reads `rerank_score` from `X-RAG-Sources`, so `rerank_rate`
+  in `--json-out` is the share of questions the model actually scored. A run against
+  a service with no reranker loaded (`RERANK_ENABLED=false`) reports `rerank_rate 0`:
+  the request is answered with the fused order, which is the degradation P1.1 specifies,
+  not an error. Record a rerank run with `RERANK_MODEL`, `RERANK_TRANSFORM`,
+  `RERANK_DEVICE` and `RERANK_DTYPE` from `/health` in the commit message: the numbers
+  are a property of the model, not of the code.
 - Absolute latency depends on the upstream server, so compare modes in one session
   on a warmed connection: the first request after a container is created pays the
   connection setup (~20 s on Windows), and a loaded upstream inflates every run.

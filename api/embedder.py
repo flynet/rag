@@ -12,11 +12,16 @@ entry points below: `embed()` for documents and `embed_query()` for queries.
 
 import asyncio
 import logging
-from typing import List, Optional
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
+
+# `sentence_transformers` is imported inside `Embedder.__init__`, the way `fastembed` is
+# imported in `SparseEmbedder` below: the cache rules are unit-tested against a fake
+# model on a machine that has torch but not sentence-transformers, and the dense path
+# should load a model at the point of use, not at import time.
 
 log = logging.getLogger("api.embedder")
 
@@ -50,7 +55,7 @@ def resolve_dtype(name: Optional[str], device: str):
     return dtype
 
 
-def _embedding_dim(model: SentenceTransformer) -> Optional[int]:
+def _embedding_dim(model) -> Optional[int]:
     """Read the embedding dimension across sentence-transformers versions."""
     # v5.4+ renamed the getter; the old name still exists but is deprecated.
     for name in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
@@ -65,7 +70,7 @@ class Embedder:
 
     expose:
         async embed(list[str]) -> np.ndarray (n, dim)          # documents
-        async embed_query(list[str]) -> np.ndarray (n, dim)    # queries
+        async embed_query(str) -> np.ndarray (1, dim)          # one retrieval query
     """
 
     def __init__(
@@ -78,6 +83,7 @@ class Embedder:
         max_seq_length: Optional[int] = None,
         query_prompt: Optional[str] = "query",
         max_concurrency: int = 1,
+        cache_size: int = 256,
     ):
         self.model_path = model_path
         self.device = device
@@ -89,14 +95,32 @@ class Embedder:
         # latency predictable. Raising it overlaps requests but uses more memory.
         self.max_concurrency = max(1, max_concurrency)
         self.encode_queue = asyncio.Semaphore(self.max_concurrency)
+        # A query embedding is a pure function of (model, prompt, text), so a
+        # repeated question does not need a forward pass. The cache is bounded by
+        # entry count, and an entry is exactly one vector: a 1024-dim float32 array is
+        # 4 KB plus ~112 B of array object, so 256 entries is ~1 MB. The key carries the
+        # query text, capped by `SearchRequest.query`, so keys add at most
+        # `cache_max * max_query_chars` bytes. `cache_size=0` turns it off. Documents
+        # are not cached: the indexer encodes each chunk once, so caching the ingest
+        # path only grows the footprint.
+        self.cache_max = max(0, cache_size)
+        self.cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self.cache_hits = 0
+        self.cache_misses = 0
 
         log.info(
-            "Loading model %s (device=%s, dtype=%s, batch=%d)",
+            "Loading model %s (device=%s, dtype=%s, batch=%d, cache=%d)",
             model_path,
             device,
             self.dtype or "model-default",
             self.batch_size,
+            self.cache_max,
         )
+
+        # Imported here, not at module level: this file's own convention for an
+        # optional heavy dependency (see `SparseEmbedder`), and it lets the cache rules
+        # be tested against a fake model on a machine without sentence-transformers.
+        from sentence_transformers import SentenceTransformer
 
         kwargs = {"device": device, "trust_remote_code": True}
         if self.dtype is not None:
@@ -160,9 +184,71 @@ class Embedder:
             vectors = await loop.run_in_executor(None, self._encode_sync, texts, prompt_name)
         return np.asarray(vectors, dtype=np.float32)
 
-    async def embed_query(self, texts: List[str]):
-        """Encode queries with the model's query prompt (when it has one)."""
-        return await self.embed(texts, prompt_name=self.query_prompt)
+    def _cache_key(self, norm: str, prompt_name: Optional[str]) -> tuple:
+        """The key a query embedding is a function of.
+
+        Model and prompt are in the key, so a redeploy with a different model, or with
+        the retrieval prompt switched off, cannot serve a vector the previous one
+        produced. The text is the string that was encoded, not a normalized variant of
+        it: lowercasing would change the embedding, so the key is exactly the encoded
+        text and nothing the cache answers is a vector for a different string.
+        """
+        return (self.model_path, prompt_name, norm)
+
+    def cache_stats(self) -> Dict[str, Any]:
+        """Cache state, reported by `/health`: the counters are what P3.2 validates.
+
+        `approx_bytes` is the bound the task asks for, read from the running service
+        rather than from the size of the dict in the source. An entry is one vector
+        (dim x 4 bytes) plus the array object (~112 B), and the query text in the key is
+        capped by `SearchRequest.query`, so the bound is the memory the container holds.
+        """
+        return {
+            "enabled": self.cache_max > 0,
+            "entries": len(self.cache),
+            "max": self.cache_max,
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "vector_dim": self.dim,
+            "approx_bytes": len(self.cache) * (self.dim * 4 + 112),
+        }
+
+    async def embed_query(self, query: str) -> np.ndarray:
+        """Encode one retrieval query with the model's query prompt (when it has one).
+
+        Returns shape `(1, dim)`, which is what `/search` indexes: `vectors[0]` is the
+        vector, not the first component of it. A query embedding is a pure function of
+        (model, prompt, text), so a repeated question costs no forward pass, and a hit
+        answers **before the encode queue** - a cached query does not wait behind a bulk
+        ingest. Documents go through `embed`, which is not cached, and `/v1/embeddings`
+        goes through `embed` as well, so it is not cached: its texts are document-side
+        and are encoded without the retrieval prompt.
+        """
+        # Whitespace around a question is not part of it, which is what makes "  q  "
+        # and "q" one cache entry. An all-whitespace query becomes a space, the guard
+        # `/embed` and `/v1/embeddings` already use: an empty text is not something to
+        # hand to the model.
+        norm = query.strip() or " "
+        key = self._cache_key(norm, self.query_prompt)
+
+        if self.cache_max and key in self.cache:
+            self.cache.move_to_end(key)
+            self.cache_hits += 1
+            log.debug("query cache hit %r (entries=%d, hits=%d, misses=%d)",
+                      norm[:80], len(self.cache), self.cache_hits, self.cache_misses)
+            return self.cache[key]
+
+        self.cache_misses += 1
+        log.debug("query cache miss %r (entries=%d, hits=%d, misses=%d)",
+                  norm[:80], len(self.cache), self.cache_hits, self.cache_misses)
+        vector = await self.embed([norm], prompt_name=self.query_prompt)
+        if self.cache_max:
+            # A copy, not a view: the cached vector is its own 4 KB, so no batch array
+            # stays alive behind it, and nothing the caller mutates can reach the cache.
+            self.cache[key] = np.array(vector, dtype=np.float32)
+            if len(self.cache) > self.cache_max:
+                self.cache.popitem(last=False)
+        return vector
 
 
 def sparse_to_dict(vector):

@@ -11,6 +11,7 @@ Public (gateway-facing) endpoints:
     GET  /health
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -40,6 +41,15 @@ from hybrid import (  # noqa: E402
     fuse,
     normalize_hits,
 )
+from rerank import (  # noqa: E402
+    RERANK_CANDIDATE_CAP,
+    candidate_limit,
+    candidate_passages,
+    pair_query,
+    rerank_results,
+    resolve_rerank,
+    resolve_rerank_instruct,
+)
 
 # Model configuration: one model instance for the whole system (see README)
 MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-Embedding-0.6B")
@@ -60,6 +70,10 @@ EMBEDDING_QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", "query").strip
 # How many encode calls may run at once. 1 serializes them on the GPU, which
 # keeps VRAM and p95 latency predictable while indexing and chat share the model.
 EMBEDDING_MAX_CONCURRENCY = max(1, int(os.environ.get("EMBEDDING_MAX_CONCURRENCY", "1")))
+# Distinct query embeddings kept for reuse, by entry count. A query vector is a pure
+# function of (model, prompt, text), so a repeated question costs no forward pass.
+# 0 disables the cache, which is what a deployment without memory headroom uses.
+EMBEDDING_CACHE_SIZE = max(0, int(os.environ.get("EMBEDDING_CACHE_SIZE", "256")))
 
 # BM25 sparse search (FastEmbed, CPU). The model is tiny and adds no GPU load.
 SPARSE_ENABLED = os.environ.get("SPARSE_ENABLED", "true").lower() in {"1", "true", "yes"}
@@ -82,15 +96,50 @@ SPARSE_WEIGHT = float(os.environ.get("SPARSE_WEIGHT", "1.0"))
 # hit.
 SPARSE_MIN_RELATIVE = float(os.environ.get("SPARSE_MIN_RELATIVE", "0.0"))
 
+# Cross-encoder reranking (P1.1). Off by default: reranking `RERANK_TOP_N`
+# candidates costs more GPU work than embedding one query, so it is enabled per
+# deployment after measuring MRR, p50/p95, and VRAM on the eval set. A reranker
+# that fails to load, times out, or answers with an unusable shape leaves the
+# fused order untouched, so enabling it can never break search.
+RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3").strip()
+# Same GPU and dtype as the embedding model by default: a 0.6B/0.5B cross-encoder
+# in fp16 fits next to Qwen3-Embedding-0.6B on an 8 GB card (measured on the
+# live stack before enabling reranking by default).
+RERANK_DEVICE = os.environ.get("RERANK_DEVICE", EMBEDDING_DEVICE).strip() or EMBEDDING_DEVICE
+RERANK_DTYPE = os.environ.get("RERANK_DTYPE", EMBEDDING_DTYPE).strip() or EMBEDDING_DTYPE
+# Token window per (query, passage) pair. Chunks are 1024 characters (~250
+# tokens) plus the title/section prefix, so 512 covers a chunk with headroom.
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "512"))
+# Character budget of the passage text before tokenization (the chunk size).
+RERANK_MAX_CHARS = int(os.environ.get("RERANK_MAX_CHARS", "1024"))
+# Candidates the cross-encoder sees per request. The P1.1 scope asks for 30-50.
+RERANK_TOP_N = max(1, min(RERANK_CANDIDATE_CAP, int(os.environ.get("RERANK_TOP_N", "30"))))
+# Requests per second budget: 1 serializes predictions on the GPU.
+RERANK_BATCH_SIZE = max(1, int(os.environ.get("RERANK_BATCH_SIZE", "16")))
+RERANK_MAX_CONCURRENCY = max(1, int(os.environ.get("RERANK_MAX_CONCURRENCY", "1")))
+# Time a rerank request may spend on the model. Overrunning it returns the fused
+# list, so a slow model degrades quality, never the request.
+RERANK_TIMEOUT = float(os.environ.get("RERANK_TIMEOUT", "10.0"))
+# raw | sigmoid | softmax - see api/reranker.py
+RERANK_TRANSFORM = os.environ.get("RERANK_TRANSFORM", "raw").strip().lower()
+# Instruction in front of the query: `qwen3` is the wording the Qwen3-Reranker
+# family is trained on, any other text is the instruction itself, empty = plain
+# pairs. A pair model trained with a prompt scores low without it, so this is a
+# quality knob: the measured probe on plain pairs for Qwen3-Reranker-0.6B was
+# `-2.0625` for a pair that is obviously a match.
+RERANK_QUERY_INSTRUCT = resolve_rerank_instruct(os.environ.get("RERANK_QUERY_INSTRUCT", ""))
+
 # Global objects (initialized at startup)
 embedder = None
 sparse_embedder = None
 qdrant_client = None
+reranker = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global embedder, sparse_embedder, qdrant_client
+    global embedder, sparse_embedder, qdrant_client, reranker
 
     log.info("Connecting to Qdrant at %s:%s", QDRANT_HOST, QDRANT_PORT)
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
@@ -105,6 +154,7 @@ async def lifespan(_: FastAPI):
         max_seq_length=EMBEDDING_MAX_SEQ_LENGTH,
         query_prompt=EMBEDDING_QUERY_PROMPT,
         max_concurrency=EMBEDDING_MAX_CONCURRENCY,
+        cache_size=EMBEDDING_CACHE_SIZE,
     )
 
     if SPARSE_ENABLED:
@@ -116,11 +166,34 @@ async def lifespan(_: FastAPI):
     else:
         log.info("BM25 sparse search is disabled (SPARSE_ENABLED=false)")
 
-    log.info("Startup complete (search mode: %s)", SEARCH_MODE)
+    if RERANK_ENABLED:
+        # Imported here so the service starts without the reranker installed.
+        from reranker import Reranker
+
+        try:
+            reranker = Reranker(
+                RERANK_MODEL,
+                device=RERANK_DEVICE,
+                dtype=RERANK_DTYPE,
+                max_length=RERANK_MAX_LENGTH,
+                batch_size=RERANK_BATCH_SIZE,
+                transform=RERANK_TRANSFORM,
+                max_concurrency=RERANK_MAX_CONCURRENCY,
+                query_instruct=RERANK_QUERY_INSTRUCT,
+            )
+        except Exception as exc:  # noqa: BLE001 - the fused order is a valid answer
+            log.error("Reranker failed to load, search keeps the fused order: %s", exc)
+            reranker = None
+
+    log.info(
+        "Startup complete (search mode: %s, rerank: %s)",
+        SEARCH_MODE,
+        "on" if reranker is not None else "off",
+    )
     yield
 
 
-app = FastAPI(title="RAG Search API", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="RAG Search API", version="2.3.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -227,14 +300,23 @@ def _dense_using() -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 
-async def _encode(texts: List[str], query: bool = False) -> np.ndarray:
+async def _encode(texts: List[str]) -> np.ndarray:
+    """Encode document texts. Not cached: the indexer encodes each chunk once."""
     if embedder is None:
         raise HTTPException(status_code=503, detail="Embedding model is not loaded yet")
-    if query:
-        vectors = await embedder.embed_query(texts)
-    else:
-        vectors = await embedder.embed(texts)
-    return np.asarray(vectors, dtype=np.float32)
+    return np.asarray(await embedder.embed(texts), dtype=np.float32)
+
+
+async def _encode_query(query: str) -> np.ndarray:
+    """Encode one retrieval query, answering from the cache when it can.
+
+    Returns shape `(1, dim)`: `/search` takes `vectors[0]` as the vector, so a scalar
+    return would read the first component as the whole vector and silently score
+    garbage. `/search` has exactly one query text, which is why this takes a string.
+    """
+    if embedder is None:
+        raise HTTPException(status_code=503, detail="Embedding model is not loaded yet")
+    return np.asarray(await embedder.embed_query(query), dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +325,12 @@ async def _encode(texts: List[str], query: bool = False) -> np.ndarray:
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
+    # The query is the key of the embedding cache (`Embedder.embed_query`), so its
+    # length is what makes the cache's memory bound real: the cap times `EMBEDDING_CACHE_SIZE`
+    # is the text the cache can hold. 4000 is the repo's own length cap (`rerank_query`
+    # below, `RERANK_QUERY_MAX_CHARS` in the gateway), and the gateway's `concat` rewrite
+    # is capped at 2000, so a rewrite fits with headroom.
+    query: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=5, ge=1, le=100)
     min_score: Optional[float] = None
     # "hybrid" (dense + BM25, RRF) or "dense" (embeddings only). Falls back to
@@ -255,6 +342,23 @@ class SearchRequest(BaseModel):
     # Keep BM25 hits within this fraction of the best BM25 score. Tuning knob for
     # `scripts/eval_retrieval.py`; `SPARSE_MIN_RELATIVE` is the service default.
     sparse_min_relative: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Cross-encoder reranking of the candidate list. `null` = the service default
+    # (`RERANK_ENABLED`); `false` forces it off for this request, so the harness
+    # can compare rerank on/off against one deployed configuration. A reranker
+    # that is not loaded, times out, or fails never reranks.
+    rerank: Optional[bool] = None
+    # Candidates the cross-encoder sees (`RERANK_TOP_N` is the service default,
+    # `1..100`). Ignored when reranking is off.
+    rerank_top_n: Optional[int] = Field(default=None, ge=1, le=RERANK_CANDIDATE_CAP)
+    # The text the cross-encoder scores the passages against. `null` = the retrieval
+    # query, which is the pre-P1.1 behavior. Set it when the retrieval query is a
+    # long rewrite: the model should judge the question the user asked, not the
+    # history injected into the rewrite. Measured on `eval/questions.multiturn.jsonl`
+    # with `Qwen/Qwen3-Reranker-0.6B`: pairs built from the `concat` rewrite rank
+    # term-noise chunks above the answer, and `mt-003`'s expected chunk moves from
+    # dense rank 9 to rank 20, out of the list in hybrid. Pairs built from the
+    # question keep the answer's terms in the pair, which is what the reranker is for.
+    rerank_query: Optional[str] = Field(default=None, min_length=1, max_length=4000)
 
 
 class SearchResult(BaseModel):
@@ -268,6 +372,11 @@ class SearchResult(BaseModel):
     char_end: Optional[int] = None
     fusion_score: Optional[float] = None
     match: Optional[str] = None
+    # Cross-encoder relevance score, `null` when reranking did not run. `score`
+    # stays the pre-rerank relevance number (dense cosine, or the BM25 weight of
+    # an exact-term hit), so `min_score` keeps its measured meaning with reranking
+    # on; `rerank_score` is what the reranker decided.
+    rerank_score: Optional[float] = None
 
 
 def _result(payload: Dict[str, Any], score: float, fusion_score: Optional[float], match: Optional[str]):
@@ -285,30 +394,34 @@ def _result(payload: Dict[str, Any], score: float, fusion_score: Optional[float]
     )
 
 
-def _search_dense(query_vector: List[float], request: SearchRequest) -> List[SearchResult]:
-    hits = _query(query_vector, request.top_k, request.min_score, using=_dense_using())
+def _candidates_dense(query_vector: List[float], request: SearchRequest, pool: int) -> List[SearchResult]:
+    """The dense branch, as many candidates as the request asked for."""
+    hits = _query(query_vector, pool, request.min_score, using=_dense_using())
     # Filter locally as well, so the /search contract does not depend on the backend
     if request.min_score is not None:
         hits = [hit for hit in hits if hit.score >= request.min_score]
     return [_result(hit.payload or {}, hit.score, None, "dense") for hit in hits]
 
 
-async def _search_hybrid(query_vector: List[float], request: SearchRequest) -> List[SearchResult]:
-    # Each branch returns more candidates than `top_k`, so RRF has material to
-    # rank: a chunk ranked 12th by BM25 can enter the final top 8 once fused.
-    candidates = min(100, max(request.top_k, request.top_k * 2))
+async def _candidates_hybrid(query_vector: List[float], request: SearchRequest, pool: int) -> List[SearchResult]:
+    """Both branches, fused with RRF, in candidate-pool size.
 
+    Each branch returns more items than `top_k` so RRF has material to rank: a
+    chunk ranked 12th by BM25 can enter the final top 8 once fused. With
+    reranking the pool is `rerank_top_n`, so the cross-encoder sees the intruders
+    RRF put at a fixed high rank.
+    """
     dense_hits = normalize_hits(
-        _query(query_vector, candidates, request.min_score, using=_dense_using())
+        _query(query_vector, pool, request.min_score, using=_dense_using())
     )
 
     sparse_query = (await sparse_embedder.embed_query([request.query]))[0]
     ratio = request.sparse_min_relative if request.sparse_min_relative is not None else SPARSE_MIN_RELATIVE
-    sparse_hits = filter_relative(normalize_hits(_query_sparse(sparse_query, candidates)), ratio)
+    sparse_hits = filter_relative(normalize_hits(_query_sparse(sparse_query, pool)), ratio)
 
     weight = request.sparse_weight if request.sparse_weight is not None else SPARSE_WEIGHT
     fused = apply_threshold(
-        fuse(dense_hits, sparse_hits, request.top_k, sparse_weight=weight),
+        fuse(dense_hits, sparse_hits, pool, sparse_weight=weight),
         request.min_score,
     )
 
@@ -326,9 +439,49 @@ async def _search_hybrid(query_vector: List[float], request: SearchRequest) -> L
     return results
 
 
+async def _rank_and_cut(
+    candidates: List[SearchResult], request: SearchRequest, rerank: bool
+) -> List[SearchResult]:
+    """Rerank the candidates and cut to `top_k`, keeping the fused order on failure.
+
+    Reranking is a quality improvement, never a hard dependency: a timeout, a
+    model error, or a score count that does not match the candidates returns the
+    fused list as it is, so the caller always gets an answer.
+    """
+    if not rerank:
+        return candidates[: request.top_k]
+
+    passages = candidate_passages(candidates, RERANK_MAX_CHARS)
+    # `rerank_query` is the text the model judges; a long retrieval rewrite scores
+    # against the short question it was built from when the caller sets it.
+    pair_text = pair_query(request.rerank_query, request.query)
+    try:
+        scores = await asyncio.wait_for(
+            reranker.score(pair_text, passages), RERANK_TIMEOUT
+        )
+    except Exception as exc:  # noqa: BLE001 - search must survive a broken reranker
+        log.warning(
+            "Reranker failed (%s), keeping the fused order for %d candidates",
+            exc,
+            len(candidates),
+        )
+        return candidates[: request.top_k]
+
+    ordered = rerank_results(candidates, scores, request.top_k)
+    if ordered is None:
+        log.warning(
+            "Reranker returned %d scores for %d candidates, keeping the fused order",
+            len(scores),
+            len(candidates),
+        )
+        return candidates[: request.top_k]
+    return ordered
+
+
 @app.post("/search", response_model=List[SearchResult])
 async def search(request: SearchRequest):
-    """Document search over the collection: dense, or dense + BM25 fused with RRF."""
+    """Document search over the collection: dense, dense + BM25 fused with RRF,
+    and optionally reranked with a cross-encoder."""
     if not _collection_exists():
         return []
 
@@ -347,14 +500,31 @@ async def search(request: SearchRequest):
         log.info("Collection has no '%s' sparse vectors - dense-only search", SPARSE_VECTOR)
         hybrid = False
 
+    # A rerank request against a service without a loaded reranker is answered
+    # with the fused order, not an error: the gateway contract stays valid.
+    rerank = resolve_rerank(request.rerank, RERANK_ENABLED, reranker is not None)
+    if request.rerank and reranker is None:
+        log.info("Rerank requested with no reranker loaded - fused order kept")
+
+    pool = candidate_limit(
+        request.top_k,
+        rerank,
+        hybrid,
+        request.rerank_top_n if request.rerank_top_n is not None else RERANK_TOP_N,
+    )
+
     # Encode the query with the model's retrieval instruction
-    # (Qwen3-Embedding: prompt_name="query").
-    query_vectors = await _encode([request.query], query=True)
+    # (Qwen3-Embedding: prompt_name="query"). A repeated question is answered from the
+    # cache without entering the encode queue.
+    query_vectors = await _encode_query(request.query)
     query_vector = query_vectors[0].astype(float).tolist()
 
     if hybrid:
-        return await _search_hybrid(query_vector, request)
-    return _search_dense(query_vector, request)
+        candidates = await _candidates_hybrid(query_vector, request, pool)
+    else:
+        candidates = _candidates_dense(query_vector, request, pool)
+
+    return await _rank_and_cut(candidates, request, rerank)
 
 
 # --------------------------------------------------------------------------- #
@@ -488,9 +658,22 @@ async def health():
         "dim": getattr(embedder, "dim", None),
         "query_prompt": getattr(embedder, "query_prompt", EMBEDDING_QUERY_PROMPT),
         "max_concurrency": getattr(embedder, "max_concurrency", EMBEDDING_MAX_CONCURRENCY),
+        # The cache is a measured behavior, so its counters are on the running
+        # service: `hits` growing on a repeated request is what closes P3.2.
+        "embedder_cache": embedder.cache_stats() if embedder is not None else {
+            "enabled": EMBEDDING_CACHE_SIZE > 0, "entries": 0, "max": EMBEDDING_CACHE_SIZE,
+            "hits": 0, "misses": 0, "vector_dim": None, "approx_bytes": 0,
+        },
         "sparse_enabled": sparse_embedder is not None,
         "sparse_model": SPARSE_MODEL if sparse_embedder is not None else None,
         "search_mode": SEARCH_MODE,
+        "rerank_enabled": reranker is not None,
+        "rerank_model": getattr(reranker, "model_path", None),
+        "rerank_top_n": RERANK_TOP_N,
+        "rerank_transform": getattr(reranker, "transform", RERANK_TRANSFORM),
+        # The instruction the query is labelled with, so a quality change can be
+        # read from the health endpoint instead of the container's env file.
+        "rerank_query_instruct": getattr(reranker, "query_instruct", RERANK_QUERY_INSTRUCT),
         "collection": COLLECTION_NAME,
         "collection_exists": collection_exists,
     }

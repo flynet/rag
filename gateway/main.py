@@ -22,12 +22,14 @@ Per-request RAG overrides (headers):
     X-RAG: off|on
     X-RAG-TOP-K: 5
     X-RAG-MIN-SCORE: 0.6
+    X-RAG-RERANK: off|on
+    X-RAG-RERANK-TOP-N: 30
 
 Retrieved sources are returned in response headers so they do not pollute the
 OpenAI response schema:
     X-RAG-Hits: 3
     X-RAG-Sources: <base64url(unpadded) of JSON
-                    [{file, chunk, score, title?, section?, char_start?, char_end?}]>
+                    [{file, chunk, score, rerank_score?, title?, section?, char_start?, char_end?}]>
 """
 
 from __future__ import annotations
@@ -109,6 +111,39 @@ RAG_MAX_TOP_K = _env_int("RAG_MAX_TOP_K", 20)
 RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", 0.3)
 RAG_TIMEOUT = _env_float("RAG_TIMEOUT", 30.0)
 
+# Cross-encoder reranking of the retrieved candidates (P1.1). Off by default:
+# `api` owns the model and the candidate pool (`RERANK_TOP_N`), and scoring 30
+# candidates costs more GPU time than embedding the query, so it is enabled per
+# deployment after measuring MRR and latency. Requests without a reranker loaded
+# on `api` are answered with the fused order, so this flag can never break chat.
+RAG_RERANK = _env_bool("RAG_RERANK", False)
+
+# The candidate pool `api` should score, mirroring `RERANK_CANDIDATE_CAP` on `api`
+# (100). `0` sends no `rerank_top_n` at all, so `api`'s `RERANK_TOP_N` applies:
+# the gateway has no model and no reason to pick a pool size by itself.
+RERANK_CANDIDATE_CAP = 100
+RAG_RERANK_TOP_N = max(0, min(_env_int("RAG_RERANK_TOP_N", 0), RERANK_CANDIDATE_CAP))
+
+# Which text the cross-encoder scores the passages against: `retrieval` (the text
+# `api` is asked to retrieve with, the pre-P1.1 behavior) or `question` (the user's
+# message, so a long `concat` rewrite is judged against the question it was built
+# from). Measured 2026-11-18 on `eval/questions.multiturn.jsonl` with
+# `Qwen/Qwen3-Reranker-0.6B`: scoring the injected history ranks term-noise chunks
+# above the answer - `mt-003`'s expected chunk is dense rank 9, hybrid rank 13, and
+# rank 20 after reranking the `concat` text. The gateway owns no model; it only
+# chooses which text travels as the pair query.
+RAG_RERANK_QUERY = os.environ.get("RAG_RERANK_QUERY", "retrieval").strip().lower() or "retrieval"
+if RAG_RERANK_QUERY not in {"retrieval", "question"}:
+    log.warning(
+        "Unknown RAG_RERANK_QUERY=%r - using 'retrieval' (expected retrieval|question)",
+        RAG_RERANK_QUERY,
+    )
+    RAG_RERANK_QUERY = "retrieval"
+
+# The `rerank_query` field of `POST /search` is capped at 4000 characters on `api`,
+# so the gateway sends the head of a long message instead of a request `api` rejects.
+RERANK_QUERY_MAX_CHARS = 4000
+
 # Follow-up query handling: off | concat | llm. "concat" joins previous user
 # turns for short/elliptical messages; "llm" asks the upstream model to rewrite
 # the query, falling back to concatenation when the call fails.
@@ -158,7 +193,7 @@ if RAG_QUERY_REWRITE == "llm" and not UPSTREAM_BASE_URL:
 
 app = FastAPI(
     title="RAG Gateway",
-    version="2.1.0",
+    version="2.3.0",
     description=(
         "OpenAI-compatible gateway in front of a self-hosted model server. "
         "Every chat completion is automatically grounded in the local "
@@ -232,6 +267,18 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 
 _TRUTHY = {"1", "true", "yes", "on", "enabled"}
 _FALSY = {"0", "false", "no", "off", "disabled"}
+
+
+def _flag_header(value: Optional[str], header: str) -> Optional[bool]:
+    """`on`/`off` header value, or `None` when the header was not sent."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in _FALSY:
+        return False
+    if text in _TRUTHY:
+        return True
+    raise StarletteHTTPException(400, f"{header} must be one of: on, off")
 
 
 async def _read_json(request: Request) -> Dict[str, Any]:
@@ -484,11 +531,50 @@ async def _prepare_retrieval_query(
     return rewritten
 
 
+def _rerank_top_n_header(value: Optional[str]) -> Optional[int]:
+    """`X-RAG-RERANK-TOP-N` as the pool `api` should score, `None` = `api`'s default.
+
+    Validated on the gateway, not passed through: `api` answers with the fused list
+    when it cannot use a pool, so a silent 4000 here is better than a request that
+    spends GPU time scoring a pool nobody asked for.
+    """
+    if value is None or not value.strip():
+        return None
+    try:
+        pool = int(value)
+    except ValueError as exc:
+        raise StarletteHTTPException(400, "X-RAG-RERANK-TOP-N must be an integer") from exc
+    if not 1 <= pool <= RERANK_CANDIDATE_CAP:
+        raise StarletteHTTPException(
+            400, f"X-RAG-RERANK-TOP-N must be 1..{RERANK_CANDIDATE_CAP}"
+        )
+    return pool
+
+
+def _rerank_query_header(value: Optional[str]) -> Optional[str]:
+    """`X-RAG-RERANK-QUERY` as the text `api` scores the passages against.
+
+    Tri-state like `X-RAG-RERANK`: no header sends no field, so `api` uses the
+    retrieval query it was given. Validated here, not passed through: a pool key and
+    a pair query cost GPU time, and a silent typo that costs a model run is worse
+    than a 400 on the request.
+    """
+    if value is None or not value.strip():
+        return None
+    mode = value.strip().lower()
+    if mode not in {"retrieval", "question"}:
+        raise StarletteHTTPException(400, "X-RAG-RERANK-QUERY must be one of: retrieval, question")
+    return mode
+
+
 def _rag_settings(
     x_rag: Optional[str],
     x_rag_top_k: Optional[str],
     x_rag_min_score: Optional[str],
-) -> tuple[bool, int, float]:
+    x_rag_rerank: Optional[str],
+    x_rag_rerank_top_n: Optional[str],
+    x_rag_rerank_query: Optional[str] = None,
+) -> tuple[bool, int, float, Optional[bool], Optional[int], Optional[str]]:
     enabled = ENABLE_RAG
 
     if x_rag is not None:
@@ -516,15 +602,53 @@ def _rag_settings(
             raise StarletteHTTPException(400, "X-RAG-MIN-SCORE must be a number") from exc
     min_score = max(-1.0, min(min_score, 1.0))
 
-    return enabled, top_k, min_score
+    # `None` (no header) sends no field, so `api`'s `RERANK_ENABLED` decides and the
+    # payload stays the pre-P1.1 one. `off` is an answer, not an absence: the gateway
+    # forwards `rerank: false`, and `api`'s `resolve_rerank` lets the request flag
+    # override the service default, which is what lets the eval harness measure
+    # rerank on/off against one deployed configuration.
+    rerank = None if x_rag_rerank is None else _flag_header(x_rag_rerank, "X-RAG-RERANK")
+    # `RAG_RERANK_TOP_N=0` is expressed as `None` here: "ask for no pool", which is
+    # what `_rag_search` sends (no pool key), so 0 never travels to `api` as a pool.
+    pool = RAG_RERANK_TOP_N or None if x_rag_rerank_top_n is None else _rerank_top_n_header(x_rag_rerank_top_n)
+    pair_query = RAG_RERANK_QUERY or None if x_rag_rerank_query is None else _rerank_query_header(
+        x_rag_rerank_query
+    )
+
+    return enabled, top_k, min_score, rerank, pool, pair_query
 
 
-async def _rag_search(query: str, top_k: int, min_score: float) -> List[Dict[str, Any]]:
+async def _rag_search(
+    query: str, top_k: int, min_score: float, rerank: Optional[bool],
+    rerank_top_n: Optional[int] = None, rerank_query_mode: Optional[str] = None,
+    question: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """One `POST /search` on `api`, with only the keys the request asked for.
+
+    `rerank_query_mode` is `retrieval` (score the text retrieval was asked with) or
+    `question` (score the user's message); `question` is that message. The pair query
+    is capped to `api`'s `rerank_query` limit, so a long message is sent as the head
+    of it rather than rejected.
+    """
+    body: Dict[str, Any] = {"query": query, "top_k": top_k, "min_score": min_score}
+    # Only sent when the client asked: a request that asks for nothing keeps the
+    # exact pre-P1.1 payload, and an older `api` without the `rerank` field is not
+    # given anything it would have to reject.
+    if rerank is not None:
+        body["rerank"] = bool(rerank)
+        # `0` means "use api's RERANK_TOP_N", so sending the pool only when it is
+        # asked for keeps the payload byte-identical on the default path. A pool
+        # alongside `rerank: false` would ask the model to score nothing.
+        if rerank and rerank_top_n:
+            body["rerank_top_n"] = int(rerank_top_n)
+        # Same rule for the pair query: it asks the model to score a specific text,
+        # so it travels only with `rerank: true`. `retrieval` sends nothing, because
+        # that is what `api` already does with the query it was given.
+        if rerank and rerank_query_mode == "question" and question:
+            body["rerank_query"] = str(question)[:RERANK_QUERY_MAX_CHARS]
+
     async with httpx.AsyncClient(timeout=RAG_TIMEOUT) as client:
-        response = await client.post(
-            f"{API_URL}/search",
-            json={"query": query, "top_k": top_k, "min_score": min_score},
-        )
+        response = await client.post(f"{API_URL}/search", json=body)
         response.raise_for_status()
         hits = response.json()
 
@@ -538,18 +662,23 @@ async def _rag_search(query: str, top_k: int, min_score: float) -> List[Dict[str
         score = hit.get("score")
         if not isinstance(score, (int, float)) or score < min_score:
             continue
-        results.append(
-            {
-                "file": hit.get("file", "unknown"),
-                "chunk": hit.get("chunk", 0),
-                "score": round(float(score), 4),
-                "text": hit.get("text", ""),
-                "title": hit.get("title"),
-                "section": hit.get("section"),
-                "char_start": hit.get("char_start"),
-                "char_end": hit.get("char_end"),
-            }
-        )
+        result = {
+            "file": hit.get("file", "unknown"),
+            "chunk": hit.get("chunk", 0),
+            "score": round(float(score), 4),
+            "text": hit.get("text", ""),
+            "title": hit.get("title"),
+            "section": hit.get("section"),
+            "char_start": hit.get("char_start"),
+            "char_end": hit.get("char_end"),
+        }
+        # The reranker's own number, kept next to `score`: `min_score` is a dense
+        # cosine threshold measured before reranking existed, so it still filters
+        # on `score`, and `rerank_score` records what the model decided.
+        rerank_score = hit.get("rerank_score")
+        if isinstance(rerank_score, (int, float)):
+            result["rerank_score"] = round(float(rerank_score), 4)
+        results.append(result)
     return results[:top_k]
 
 
@@ -583,6 +712,10 @@ def _format_context_block(hits: List[Dict[str, Any]]) -> str:
             attrs.append(f'section="{_xml_attr(hit["section"])}"')
         if hit.get("char_start") is not None:
             attrs.append(f'chars="{hit["char_start"]}-{hit.get("char_end", "")}"')
+        # The reranker's number is shown next to the pre-rerank relevance, so a
+        # grounded answer can be audited against what the cross-encoder scored.
+        if hit.get("rerank_score") is not None:
+            attrs.append(f'rerank="{hit["rerank_score"]}"')
         lines.append(f'<document {" ".join(attrs)}>')
         lines.append(hit.get("text", ""))
         lines.append("</document>")
@@ -628,6 +761,8 @@ def _rag_headers(hits: List[Dict[str, Any]]) -> Dict[str, str]:
                 "chunk": hit["chunk"],
                 "score": hit["score"],
             }
+            if hit.get("rerank_score") is not None:
+                item["rerank_score"] = hit["rerank_score"]
             for key in ("title", "section", "char_start", "char_end"):
                 if hit.get(key) is not None:
                     item[key] = hit[key]
@@ -751,6 +886,9 @@ async def chat_completions(
     x_rag: Optional[str] = Header(default=None),
     x_rag_top_k: Optional[str] = Header(default=None),
     x_rag_min_score: Optional[str] = Header(default=None),
+    x_rag_rerank: Optional[str] = Header(default=None),
+    x_rag_rerank_top_n: Optional[str] = Header(default=None),
+    x_rag_rerank_query: Optional[str] = Header(default=None),
     _: None = Depends(require_api_key),
 ):
     body = await _read_json(request)
@@ -763,7 +901,10 @@ async def chat_completions(
     if not isinstance(messages, list) or not messages:
         raise StarletteHTTPException(400, "'messages' must be a non-empty array")
 
-    rag_enabled, top_k, min_score = _rag_settings(x_rag, x_rag_top_k, x_rag_min_score)
+    rag_enabled, top_k, min_score, rerank, rerank_top_n, rerank_query_mode = _rag_settings(
+        x_rag, x_rag_top_k, x_rag_min_score, x_rag_rerank, x_rag_rerank_top_n,
+        x_rag_rerank_query
+    )
 
     hits: List[Dict[str, Any]] = []
     if rag_enabled:
@@ -782,7 +923,10 @@ async def chat_completions(
                     retrieval_query[:120],
                 )
             try:
-                hits = await _rag_search(retrieval_query, top_k, min_score)
+                hits = await _rag_search(
+                    retrieval_query, top_k, min_score, rerank, rerank_top_n,
+                    rerank_query_mode, query
+                )
             except Exception as exc:  # noqa: BLE001 - RAG must never break chat
                 log.warning("RAG search failed, answering without context: %s", exc)
             if hits:
@@ -923,6 +1067,11 @@ async def health():
         "defaults": {
             "top_k": RAG_TOP_K,
             "min_score": RAG_MIN_SCORE,
+            "rerank": RAG_RERANK,
+            # `null` = the gateway asks for no pool and `api`'s RERANK_TOP_N applies
+            "rerank_top_n": RAG_RERANK_TOP_N or None,
+            # which text the cross-encoder scores: `retrieval` or `question`
+            "rerank_query": RAG_RERANK_QUERY,
             "query_rewrite": RAG_QUERY_REWRITE,
             "rewrite_history": RAG_REWRITE_HISTORY,
         },

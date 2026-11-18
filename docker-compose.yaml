@@ -83,6 +83,9 @@ services:
       # Encode calls allowed at once. 1 serializes them on the GPU so bulk
       # indexing and chat queries queue instead of competing for VRAM.
       - EMBEDDING_MAX_CONCURRENCY=${EMBEDDING_MAX_CONCURRENCY:-1}
+      # Query embedding cache, entries. 0 = off. The compose default matches the
+      # api default, so a stack without an .env file behaves the measured way.
+      - EMBEDDING_CACHE_SIZE=${EMBEDDING_CACHE_SIZE:-256}
       # Retrieval prompt name for queries (Qwen3-Embedding: "query").
       # Empty = encode queries without an instruction, like documents. A single
       # dash keeps an explicitly empty value empty, so `EMBEDDING_QUERY_PROMPT=`
@@ -105,6 +108,38 @@ services:
       # single-turn recall@10 and the best multiturn compromise.
       - SPARSE_WEIGHT=${SPARSE_WEIGHT:-1.0}
       - SPARSE_MIN_RELATIVE=${SPARSE_MIN_RELATIVE:-0.7}
+      # Cross-encoder reranking (P1.1). Off by default: scoring `RERANK_TOP_N`
+      # candidates costs more GPU time than embedding the query, so it is enabled
+      # after measuring MRR, p50/p95 and VRAM on the eval set. A reranker that
+      # fails to load, times out, or answers with a bad shape leaves the fused
+      # order, so enabling it can never break search.
+      - RERANK_ENABLED=${RERANK_ENABLED:-false}
+      - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      # Same GPU and dtype as the embedding model by default: a ~0.5B
+      # cross-encoder in fp16 fits next to Qwen3-Embedding-0.6B.
+      - RERANK_DEVICE=${RERANK_DEVICE:-cuda}
+      - RERANK_DTYPE=${RERANK_DTYPE:-float16}
+      # Candidates the cross-encoder scores per request (the P1.1 scope is 30-50).
+      - RERANK_TOP_N=${RERANK_TOP_N:-30}
+      # Token window per (query, passage) pair; a 1024-character chunk plus the
+      # title/section prefix fits inside 512.
+      - RERANK_MAX_LENGTH=${RERANK_MAX_LENGTH:-512}
+      # Character budget of the passage text (the chunk size).
+      - RERANK_MAX_CHARS=${RERANK_MAX_CHARS:-1024}
+      # Pairs per predict call, and predict calls allowed at once. 1 serializes
+      # the GPU the same way EMBEDDING_MAX_CONCURRENCY does, so a rerank burst and
+      # a bulk ingest queue instead of competing for VRAM.
+      - RERANK_BATCH_SIZE=${RERANK_BATCH_SIZE:-16}
+      - RERANK_MAX_CONCURRENCY=${RERANK_MAX_CONCURRENCY:-1}
+      # A rerank overrunning this many seconds returns the fused list.
+      - RERANK_TIMEOUT=${RERANK_TIMEOUT:-10}
+      # raw | sigmoid | softmax - see api/reranker.py
+      - RERANK_TRANSFORM=${RERANK_TRANSFORM:-raw}
+      # Instruction in front of the query. `qwen3` = the wording the Qwen3-Reranker
+      # family is trained on; any other text is the instruction itself; empty =
+      # plain pairs. A pair model trained with a prompt scores low without it, so
+      # this is set per model, after measuring it, never as a global default.
+      - RERANK_QUERY_INSTRUCT=${RERANK_QUERY_INSTRUCT:-}
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - COLLECTION_NAME=documents
@@ -150,6 +185,17 @@ services:
       - ENABLE_RAG=${ENABLE_RAG:-true}
       - RAG_TOP_K=${RAG_TOP_K:-8}
       - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.3}
+      # Ask `api` to rerank the retrieved candidates with its cross-encoder.
+      # Off by default, and per-request with the X-RAG-RERANK: on|off header.
+      - RAG_RERANK=${RAG_RERANK:-false}
+      # Candidate pool to ask `api` to score; 0 = send no pool key and use api's
+      # RERANK_TOP_N. Per-request with X-RAG-RERANK-TOP-N.
+      - RAG_RERANK_TOP_N=${RAG_RERANK_TOP_N:-0}
+      # retrieval | question - which text the cross-encoder scores the passages
+      # against: the text retrieval was asked with, or the user's message, so a long
+      # `concat` rewrite is judged against the question it was built from.
+      # Per-request with X-RAG-RERANK-QUERY.
+      - RAG_RERANK_QUERY=${RAG_RERANK_QUERY:-retrieval}
       # off | concat | llm - rewrite follow-up questions before retrieval
       - RAG_QUERY_REWRITE=${RAG_QUERY_REWRITE:-concat}
       - RAG_REWRITE_HISTORY=${RAG_REWRITE_HISTORY:-3}

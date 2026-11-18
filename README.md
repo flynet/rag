@@ -17,6 +17,7 @@ There is no chat UI — the service exposes an API only. Any OpenAI-compatible c
 - Automatic document indexing: startup reconciliation, `watchdog` file monitoring, incremental updates (unchanged files are skipped by a stored signature)
 - Structure-aware chunking (Markdown headings → paragraphs → sentences, 1024-character chunks, 128-character overlap) with section paths and character offsets for citations
 - Hybrid retrieval: dense embeddings + BM25 sparse vectors fused with RRF, so exact identifiers, product codes and rare names are found (`SEARCH_MODE=dense` restores the embeddings-only behaviour)
+- Optional cross-encoder reranking of the fused candidates (`RERANK_ENABLED=true` on `api`, `RAG_RERANK` and the `X-RAG-RERANK` header on the gateway): the model judges the text, so a BM25 term-noise hit sitting at a fixed high RRF rank can move below the cut. Which text it judges is a knob too — `RAG_RERANK_QUERY=retrieval|question` and `X-RAG-RERANK-QUERY`, so a long `concat` rewrite can be scored against the question it was built from. A reranker that fails to load, times out, or answers with an unusable shape returns the fused order
 - RAG enabled by default: retrieved chunks are injected into the current user turn; retrieval is skipped inside agent tool loops
 - Per-request RAG control via `X-RAG-*` headers, sources returned in `X-RAG-Sources`
 - Follow-up query rewriting for short messages (`RAG_QUERY_REWRITE=off|concat|llm`, `concat` by default)
@@ -91,6 +92,8 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 │   ├── main.py                  # /search, /embed, /v1/embeddings
 │   ├── embedder.py              # SentenceTransformer + FastEmbed BM25 wrappers
 │   ├── hybrid.py                # RRF fusion and the min_score rules (stdlib)
+│   ├── rerank.py                # candidate pooling, passage text, ordering rules (numpy)
+│   ├── reranker.py              # CrossEncoder wrapper (loads only when RERANK_ENABLED=true)
 │   └── requirements.txt
 ├── gateway/                     # public OpenAI-compatible gateway
 │   ├── Dockerfile
@@ -125,7 +128,10 @@ The arrows are the calls the services actually make: `gateway → upstream` (cha
 ├── tests/
 │   ├── test_eval_metrics.py       # unit tests for the eval math (no GPU/API needed)
 │   ├── test_gateway_rewrite.py    # unit tests for follow-up query rewriting
+│   ├── test_gateway_rerank.py     # rerank flag, request payload, citation passthrough
 │   ├── test_hybrid.py             # RRF fusion, thresholds, sparse wire format
+│   ├── test_rerank.py             # candidate pool, passage text, ordering, score transforms
+│   ├── test_chunking.py           # splitter, section paths, offsets, overlap
 │   ├── test_vector_db_schema.py   # collection schema migration and upsert shape
 │   ├── test_reconcile_check.py    # unit tests for the index-vs-folder check
 │   └── test_qdrant_upgrade_check.py # unit tests for the version-change rehearsal
@@ -148,6 +154,7 @@ Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this re
 - **Behavior:**
   - validates `Authorization: Bearer <key>` against `API_KEYS`
   - retrieves context for the last user message
+  - asks `api` to rerank the retrieved candidates when `RAG_RERANK=true` or the `X-RAG-RERANK: on` header is sent, and forwards an explicit `rerank: false` when the client sends `X-RAG-RERANK: off`, so one deployment with the model loaded can be measured on its fused path. The reranker lives on `api`, so a request with rerank on and no reranker loaded there is answered with the fused order
   - injects retrieved documents into the text of that user message
   - forwards the request to the upstream OpenAI-compatible server with full body passthrough
   - authenticates to the upstream with `UPSTREAM_API_KEY`; the agent's key is never sent upstream
@@ -159,14 +166,19 @@ Qdrant storage is a named Docker volume (`qdrant_data`), not a folder in this re
 
 - **Port:** `8000` (debug only; agents use the gateway)
 - **Endpoints:**
-  - `POST /search` — hybrid retrieval: dense vector + BM25 sparse vector, fused with RRF (used by the gateway); `mode`/`sparse_weight`/`sparse_min_relative` are per-request overrides
+  - `POST /search` — hybrid retrieval: dense vector + BM25 sparse vector, fused with RRF (used by the gateway); `mode`/`sparse_weight`/`sparse_min_relative` are per-request overrides, and `rerank`/`rerank_top_n` ask the cross-encoder to re-score the candidate pool
   - `POST /embed` — internal batch endpoint for the indexer (dense vectors + BM25 weights)
-  - `POST /v1/embeddings` — OpenAI-compatible embeddings
+  - `POST /v1/embeddings` — OpenAI-compatible embeddings (document-side texts, no retrieval prompt; **not cached**)
   - `GET /collection/info` — collection statistics (named vectors, sparse vectors, points)
   - `GET /collection/sample` — sample points
-  - `GET /health` — model, device, dimension, BM25 status, search mode, collection status
-- **Models:** the embedding model is loaded here and only here (fp16 on GPU); the BM25 model is a FastEmbed CPU model (~5 MB) in the same process
+  - `GET /health` — model, device, dimension, BM25 status, search mode, reranker status, collection status, and the query embedding cache counters (`embedder_cache`: `enabled`/`entries`/`max`/`hits`/`misses`/`vector_dim`/`approx_bytes`)
+- **Models:** the embedding model is loaded here and only here (fp16 on GPU); the BM25 model is a FastEmbed CPU model (~5 MB) in the same process; the cross-encoder reranker is loaded only when `RERANK_ENABLED=true` (same GPU, serialized predictions)
 - **Swagger:** http://localhost:8000/docs
+- **Query embedding cache** (`EMBEDDING_CACHE_SIZE`, default 256 entries): `POST /search` encodes a query once per distinct text, so a repeated question costs no forward pass.
+  - Key: `(model path, query prompt name, the query text with surrounding whitespace stripped)`. Case is kept: lowercasing would change the vector. `EMBEDDING_NORMALIZE`, `EMBEDDING_DTYPE` and `EMBEDDING_MAX_SEQ_LENGTH` are not in the key — changing them restarts the container, which starts with an empty cache. The key carries the prompt *name* (`EMBEDDING_QUERY_PROMPT`, default `query`), not the instruction text the model stores under it; switching the prompt off (`EMBEDDING_QUERY_PROMPT=`) is a restart, and a restart clears the cache.
+  - Bounded by entry count with LRU eviction: 256 × (1024-dim float32 vector, ~4.2 KB with the array object) ≈ 1.0 MB, plus the key text, capped by the 4000-char limit on `query`. `0` disables the cache.
+  - A cache hit is answered **before** the encode queue, so a repeated question does not wait behind bulk indexing (`EMBEDDING_MAX_CONCURRENCY=1`).
+  - Not cached: documents (`POST /embed`, the indexer encodes each chunk once), `POST /v1/embeddings`, and BM25 (`SparseEmbedder`, CPU ONNX). The cache lives in one `api` process and is cleared on restart; the gateway does not cache queries.
 
 ### Embedder — indexing
 
@@ -305,6 +317,13 @@ fails to load, or a collection without `bm25` vectors all give dense-only search
 reports `sparse_enabled`, `SEARCH_MODE=dense` disables the sparse branch for every request). A
 chunk without a sparse vector is found by semantic search and not by exact-term search, which is
 the intended degradation: indexing never stops because BM25 is unavailable.
+
+The same rule applies to the reranker: `RERANK_ENABLED=false` (the shipped default), a model
+that fails to load, a rerank that overruns `RERANK_TIMEOUT`, and a score count that does not
+match the candidates all return the fused list unchanged (`/health` reports `rerank_enabled`
+and `rerank_model`). A request asking for reranking with no reranker loaded is answered with
+the fused order, not an error. Reranking is a quality improvement, never a hard dependency:
+the answer, the citations, and the `min_score` threshold behave exactly as before it existed.
 
 #### Index integrity (watched folder vs index)
 
@@ -484,6 +503,9 @@ for chunk in stream:
 | `X-RAG` | `on` / `off` | enable or disable retrieval for the request |
 | `X-RAG-TOP-K` | `1..20` | number of chunks to inject |
 | `X-RAG-MIN-SCORE` | `-1.0..1.0` | minimum cosine score |
+| `X-RAG-RERANK` | `on` / `off` | ask `api` to re-score the candidates with its cross-encoder, or refuse it: `on` sends `rerank: true`, `off` sends `rerank: false` and overrides `RERANK_ENABLED` on that service; omitted = no field is sent, so the `RAG_RERANK` default applies |
+| `X-RAG-RERANK-QUERY` | `retrieval` / `question` | which text the cross-encoder judges the passages against: `retrieval` is the text retrieval was asked with (a `concat` rewrite is judged as written), `question` is the user's message, so a long rewrite is scored against the question it was built from. Travels only with `rerank: on`; `retrieval` sends no field at all. Measured 2026-11-18: scoring the injected history ranks its term overlap above the answer, and `mt-003`'s expected chunk moves from dense rank 9 to rank 20 |
+| `X-RAG-RERANK-TOP-N` | `1..100` | candidate pool `api` should score; omitted = `RAG_RERANK_TOP_N`, and `0` there means send no pool key (`api`'s `RERANK_TOP_N` applies). The pool travels only with `rerank: true` — a pool alongside `rerank: false` would ask the model to score nothing |
 
 ```bash
 # answer without the knowledge base
@@ -497,9 +519,12 @@ The response body stays strictly OpenAI-compatible, so retrieved sources are ret
 | Header | Value |
 |---|---|
 | `X-RAG-Hits` | number of injected chunks |
-| `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score","title?","section?","char_start?","char_end?"}]` |
+| `X-RAG-Sources` | unpadded base64url-encoded JSON: `[{"file","chunk","score","rerank_score?","title?","section?","char_start?","char_end?"}]` |
 
 `title`, `section`, and character offsets are included when the indexed chunk has them.
+`rerank_score` is included only when the reranker ran for that request. `score` stays the
+pre-rerank relevance number (dense cosine, or the BM25 weight of an exact-term hit), so
+`min_score` keeps its measured meaning with reranking on.
 
 Decoding:
 
@@ -536,7 +561,7 @@ If the `api` service is unavailable, the gateway does **not** break chat: the re
 
 The rewrite fires only when the request carries a history and the last user message is short or elliptical; requests without history and long questions are sent unchanged. Mode comparison and measured numbers: [eval/README.md](eval/README.md).
 
-**Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, and `chars="start-end"` attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
+**Where the context goes.** The `<knowledge_base>` block is prepended to the `content` of the last user message; the actual question stays at the end. Each `<document>` carries `source`, `relevance`, and, when available, `title`, `section`, `chars="start-end"`, and `rerank="..."` (the cross-encoder's number, present only when reranking ran) attributes. No separate `system` message is added, so the `system + history` prefix stays byte-identical and upstream prompt caching keeps working. Chat templates that require `system` to be the first message (ChatML, Llama 3) are not broken.
 
 ### `POST /v1/embeddings`
 
@@ -572,7 +597,7 @@ Public, no authentication. Checks the model server and the `api` service.
   "status": "ok",
   "rag_enabled": true,
   "auth_required": true,
-  "defaults": {"top_k": 8, "min_score": 0.3, "query_rewrite": "concat", "rewrite_history": 3},
+  "defaults": {"top_k": 8, "min_score": 0.3, "rerank": false, "query_rewrite": "concat", "rewrite_history": 3},
   "dependencies": {
     "upstream": {"url": "http://192.168.1.50:8000/v1", "ok": true, "status": 200},
     "api": {"url": "http://api:8000", "ok": true, "status": 200}
@@ -605,8 +630,43 @@ curl -X POST http://localhost:8000/search -H "Content-Type: application/json" \
 | `mode` | `SEARCH_MODE` (`hybrid`) | `dense` runs embeddings only; `hybrid` runs both branches |
 | `sparse_weight` | `SPARSE_WEIGHT` | RRF weight of the BM25 branch, tuning knob |
 | `sparse_min_relative` | `SPARSE_MIN_RELATIVE` | drop BM25 hits below this fraction of the best BM25 score, tuning knob |
+| `rerank` | `RERANK_ENABLED` (`false`) | `true` re-scores the candidate pool with the cross-encoder; `null` = the service default; `false` forces reranking off for this request, so the eval harness can compare on/off against one deployed configuration |
+| `rerank_top_n` | `RERANK_TOP_N` (`30`) | candidates the cross-encoder sees, `1..100`; ignored when reranking is off |
 
 `score` is a relevance number the gateway can filter on: the dense cosine when the dense branch found the chunk, otherwise the BM25 weight of the exact-term match. `fusion_score` is the RRF rank score, which has no cosine meaning on its own; `match` is `dense`, `sparse`, or `both`. `X-RAG-Sources` carries `score`, not `fusion_score`.
+`rerank_score` is the cross-encoder's number, `null` when reranking did not run.
+
+**Reranking** (`rerank=true`): `api` asks each Qdrant branch for `rerank_top_n` candidates,
+fuses them with RRF, scores every candidate with the cross-encoder (the query plus the
+chunk's title/section prefix line and its text), and returns the best `top_k` ordered by
+the model. Ties keep the fused order, so a rerun gives the same answer. Reranking is
+never a hard dependency: a reranker that fails to load, times out (`RERANK_TIMEOUT`), or
+returns a score count that does not match the candidates returns the fused order
+unchanged, and a request with `rerank=true` against a service with no reranker loaded is
+answered the same way. `min_score` keeps filtering on `score`, so the reranker changes
+the order, not the threshold.
+
+```bash
+# rerank 30 candidates and return the best 8
+curl -X POST http://localhost:8000/search -H "Content-Type: application/json" \
+  -d '{"query": "and the min score?", "top_k": 8, "rerank": true, "rerank_top_n": 30}'
+```
+
+```json
+[
+  {"score": 0.42, "rerank_score": 3.1, "fusion_score": 0.0156, "match": "sparse",
+   "text": "...", "file": "/data/documents/TODO.md", "chunk": 21,
+   "title": "RAG Gateway", "section": "P1", "char_start": 4100, "char_end": 5100}
+]
+```
+
+Both services carry contract version `2.3.0` (`FastAPI(..., version="2.3.0")`). The
+reranker build is `2.2.0`: its `/search` has the `rerank` and `rerank_top_n` fields;
+`2.3.0` adds `rerank_query` (the text the cross-encoder scores the passages against)
+and `X-RAG-RERANK-QUERY`. A gateway before `2.2.0` sends the payload without those keys,
+and a gateway before `2.3.0` sends no `rerank_query`, so the versions interoperate: an
+older pair of services keeps the fused order, an older `api` ignores the key it does not
+know.
 
 ## Configuration
 
@@ -627,11 +687,23 @@ Variables are read from `.env` (see [`.env.example`](.env.example)).
 | `ENABLE_RAG` | `true` | global RAG switch |
 | `RAG_TOP_K` | `8` | chunks injected into the prompt |
 | `RAG_MIN_SCORE` | `0.3` | cosine-score threshold; model-dependent, re-tune after changing the model |
+| `RAG_RERANK` | `false` | ask `api` to rerank the retrieved candidates; per-request `X-RAG-RERANK: on\|off` |
+| `RAG_RERANK_TOP_N` | `0` | candidate pool to ask `api` to score (`1..100`); `0` sends no pool key, so `api`'s `RERANK_TOP_N` applies; per-request `X-RAG-RERANK-TOP-N` |
+| `RAG_RERANK_QUERY` | `retrieval` | which text the cross-encoder judges: `retrieval` (the text retrieval was asked with) or `question` (the user's message, so a long `concat` rewrite is scored against the question it was built from); per-request `X-RAG-RERANK-QUERY`. The pair query travels only with `rerank: true`, and `retrieval` sends no field |
 | `SEARCH_MODE` | `hybrid` | `hybrid` (dense + BM25 fused with RRF) or `dense` (embeddings only) |
 | `SPARSE_ENABLED` | `true` | load the BM25 model; `false` means dense-only search and no `bm25` vectors in the collection |
 | `SPARSE_MODEL` | `Qdrant/bm25` | FastEmbed BM25 model id; part of the index signature, so changing it re-indexes every file |
 | `SPARSE_WEIGHT` | `1.0` | RRF weight of the BM25 branch (the dense branch is fixed at `1.0`); measured value, see [eval/p21-sweep.md](eval/p21-sweep.md) |
 | `SPARSE_MIN_RELATIVE` | `0.7` | drop BM25 hits below this fraction of the best BM25 score for the query; measured value, see [eval/p21-sweep.md](eval/p21-sweep.md) |
+| `RERANK_ENABLED` | `false` | load the cross-encoder reranker on `api`; `true` scores the candidate pool before cutting to `top_k` |
+| `RERANK_MODEL` | `Qwen/Qwen3-Reranker-0.6B` | cross-encoder id, the measured default (`BAAI/bge-reranker-v2-m3` fails the follow-up MRR gate, see [eval/README.md](eval/README.md)); `jina-reranker-v2-base-multilingual` is the third option |
+| `RERANK_TOP_N` | `30` | candidates the cross-encoder scores per request (`1..100`); measured: pool 30 is enough, pool 50 gives the same grids at higher latency |
+| `RERANK_DEVICE` / `RERANK_DTYPE` | `EMBEDDING_DEVICE` / `EMBEDDING_DTYPE` | the same GPU and precision as the embedding model by default; `cpu` when VRAM is tight |
+| `RERANK_MAX_LENGTH` / `RERANK_MAX_CHARS` | `512` / `1024` | token window per (query, passage) pair, and the character budget of the passage text |
+| `RERANK_BATCH_SIZE` / `RERANK_MAX_CONCURRENCY` | `16` / `1` | pairs per predict call, and predict calls allowed at once; `1` serializes them on the GPU |
+| `RERANK_TIMEOUT` | `10` | seconds a rerank may spend on the model; overrunning it returns the fused order |
+| `RERANK_TRANSFORM` | `raw` | `raw` (classifier-head logits), `sigmoid`, or `softmax` (yes/no token logits). For `Qwen3-Reranker-0.6B` under `sentence-transformers` `softmax` never fires (one logit per pair), so `raw` is the setting and `sigmoid` is the probability variant |
+| `RERANK_QUERY_INSTRUCT` | `""` | instruction in front of the query: `qwen3` = the wording the Qwen3-Reranker family is trained on, any other text is the instruction itself, empty = plain pairs. **Measured: plain pairs are the better setting for this model on this corpus** — with `qwen3` the single-turn grid is worse (`recall@10 0.900` vs `0.917`, `MRR@10 0.621` vs `0.649`), and the instruction does not put `mt-003` back in the top ten |
 | `RAG_QUERY_REWRITE` | `concat` | follow-up query mode: `off`, `concat`, or `llm` |
 | `RAG_REWRITE_HISTORY` | `3` | previous user turns considered by the rewrite |
 | `RAG_REWRITE_TIMEOUT` | `10` | timeout for the `llm` rewrite call, seconds |
@@ -663,6 +735,7 @@ Set in `docker-compose.yaml`:
 | `HF_HOME` | `/models/hf-cache` | Hugging Face cache inside the container |
 | `EMBEDDING_BATCH_SIZE` | `${EMBED_BATCH_SIZE}` | texts per forward pass |
 | `EMBEDDING_MAX_CONCURRENCY` | `${EMBEDDING_MAX_CONCURRENCY}` = `1` | encode calls allowed at once; `1` serializes them on the GPU so indexing and chat queue instead of competing for VRAM |
+| `EMBEDDING_CACHE_SIZE` | `${EMBEDDING_CACHE_SIZE}` = `256` | distinct query embeddings kept for reuse; a repeated question costs no forward pass, `0` disables. Counters (`hits`/`misses`/`entries`/`approx_bytes`) are in `api` `/health` under `embedder_cache`. Documents are not cached |
 | `EMBEDDING_NORMALIZE` | `true` | L2-normalize output vectors |
 | `EMBEDDING_MODEL_NAME` | `rag-embeddings` | `model` field returned by `/v1/embeddings` |
 | `BM25_THREADS` | `0` (auto) | ONNX threads for the BM25 model; CPU only, no GPU load |
@@ -732,6 +805,27 @@ python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/
 ```
 
 The shipped `RAG_TOP_K=8` / `RAG_MIN_SCORE=0.3` come from that sweep on the sample corpus; the recorded grids are in [eval/README.md](eval/README.md).
+
+Reranking is measured the same way, one retrieval pass per pool size:
+
+```bash
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank on --rerank-top-n 30 --json-out eval/rerank-30.json
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank on --sweep-rerank-top-n 30,50 --sweep --sweep-md eval/sweep-rerank.md
+python scripts/eval_retrieval.py --questions eval/questions.jsonl --corpus eval/corpus \
+    --rerank off --json-out eval/rerank-off.json          # the same service, rerank forced off
+```
+
+`--rerank on` sends `rerank: true` (and `X-RAG-RERANK: on` in gateway mode), `--rerank off`
+sends the explicit `false`, and the default sends no field at all, so a baseline run stays
+byte-identical to a build without reranking. `--sweep-rerank-top-n 30,50` runs one pass per
+pool, so the grid compares pool sizes against the unlabelled fused rows. The harness ranks the
+injected chunks by `rerank_score` when the response carries it, so the numbers describe the
+order the gateway injects, not the fused position; a `rerank=N` row with `rerank_rate=0` in the
+JSON means the model was asked for and did not run, so that row is the fused baseline: the
+reranker is never a hard dependency. The gates stay the same,
+`--min-recall 0.70 --min-mrr 0.35`, with `recall@10` as the reference.
 
 The model is downloaded into `./models/hf-cache` on first start and is reused across container restarts. Old weights are not deleted automatically; after switching, you can remove `models--google--embeddinggemma-300m` to free ~0.6 GB.
 
@@ -852,23 +946,29 @@ docker compose restart gateway
 Code map:
 
 - `gateway/main.py` — `require_api_key`, `_rag_search`, `_inject_context`, `/v1/chat/completions`, `/v1/embeddings`
-- `api/main.py` — `/search` (dense + BM25 branches through Qdrant `query_points`, RRF fusion, citation metadata), `/embed` (dense vectors + BM25 weights), `/v1/embeddings`
+- `api/main.py` — `/search` (dense + BM25 branches through Qdrant `query_points`, RRF fusion, optional cross-encoder rerank, citation metadata), `/embed` (dense vectors + BM25 weights), `/v1/embeddings`
 - `api/embedder.py` — `Embedder`: fp16 loading, batching, normalization, query prompt; `SparseEmbedder`: FastEmbed BM25 (CPU, document weights and query term frequency)
 - `api/hybrid.py` — `normalize_hits`, `fuse` (RRF with the BM25 weight), `filter_relative`, `apply_threshold` (the threshold applies to the dense cosine, BM25-only hits pass)
+- `api/rerank.py` — `candidate_limit` (the pool each branch must return), `resolve_rerank` (request flag over the service default, never on without a loaded model), `passage_text` (title/section prefix line inside the character budget), `rerank_order` (descending, ties keep the fused order), `rerank_results` (refuses a mismatched score count), `apply_transform` (raw / sigmoid / softmax); numpy only
+- `api/reranker.py` — `Reranker`: `CrossEncoder` wrapper, predictions serialized on the GPU the same way `Embedder` serializes encode calls, `score(query, passages)`
 - `embedder/main.py` — `DebounceHandler`, `ingestion_worker`, `file_signature` (mtime, size, chunking, dense model, BM25 model)
 - `embedder/chunking.py` — `split_text_into_chunks`, `TextChunk`, heading/section metadata and offsets
 - `embedder/embedder.py` — `RemoteEmbedder`: HTTP client for `api` with retries, a readiness wait, and `embed_with_sparse` (dense + sparse, batch-aligned)
 - `embedder/vector_db.py` — `VectorDB`: `ensure_collection` (named `dense` + sparse `bm25`, schema migration by recreating the collection), upsert of both vectors with chunk metadata and a file signature, startup reconciliation, `is_up_to_date`
 - `scripts/smoke_test.py` — end-to-end check of health, models, embeddings, chat, and RAG headers
-- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, one keep-alive connection for the whole run
-- `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, and `chunks_added`
+- `scripts/eval_retrieval.py` — retrieval-quality evaluation (recall@k, MRR@10, nDCG@10) against a JSONL question set; `search` and `gateway` modes, offline `top_k` × `min_score` sweep, offline corpus validation, cross-encoder rerank passes (`--rerank on|off|default`, `--rerank-top-n`, `--sweep-rerank-top-n`), `rerank_rate`, ranking by `rerank_score`, one keep-alive connection for the whole run
+- `scripts/latency_probe.py` — p50/p95/p99 of `POST /search` when idle, while synthetic documents are being indexed, and after indexing settles; the latency multiplier under ingest, `chunks_added`, and the reranker's cost (`--rerank on --rerank-top-n 30 --rerank-compare` measures the reranked path against the fused one on one deployment)
+- `scripts/upstream_stub.py` — a stand-in OpenAI-compatible upstream (stdlib, `/v1/models` + `/v1/chat/completions`, streaming and non-streaming): gateway-mode retrieval measurement needs a gateway that answers, not a model that reasons, so pointing `UPSTREAM_BASE_URL` at the stub isolates retrieval latency and lets a gateway run complete when the LLM server is not reachable
+- `scripts/diagnose_rerank.py` — prints every candidate one question returned, in the order it was injected, with `score`, `rerank_score`, file, section, chunk, the chunk text, and a `*` on the chunks the question's `relevant` entry matches: `first_rank` says a chunk moved, this says which chunk beat it and by what number (`--mode search` asks `api`, `--mode gateway` reads `X-RAG-Sources` so the follow-up rewrite is part of the request)
 - `scripts/reconcile_check.py` — compares the files under the watched folder with the `payload.file` values in Qdrant (`audit`), counts chunks per file (`count`), and checks whether a file is in the top hits of a query (`search --expect/--absent`); stdlib only
 - `scripts/qdrant_upgrade_check.py` — rehearses a Qdrant version change: copies the live volume to a scratch volume, starts the target image on it, restores a snapshot into a fresh volume, and compares `status`/`points`/`dim`/distinct `payload.file` plus a self-vector query with the live collection; stdlib only, the live volume is never written
 - `scripts/qdrant_snapshot.py` — create, list, download, prune, delete snapshots; restore a collection from a local file (stdlib only)
 
-Unit tests (fusion and threshold rules, the sparse wire format, collection-schema
-migration, evaluation math, gateway rewrite, snapshot and upgrade rehearsal, index
-reconciliation) run without GPU, API, or Docker:
+Unit tests (fusion and threshold rules, the sparse wire format, the rerank pool,
+passage, ordering, and transform rules, the gateway rerank flag and citation
+passthrough, structure-aware chunking, collection-schema migration, evaluation
+math, gateway rewrite, snapshot and upgrade rehearsal, index reconciliation) run
+without GPU, API, or Docker:
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
